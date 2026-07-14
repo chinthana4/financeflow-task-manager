@@ -843,6 +843,7 @@ tbody td{padding:14px 16px;vertical-align:middle}
         <button class="btn btn-sm btn-primary" onclick="switchRoutineTab('daily')" id="routine-tab-daily">Daily</button>
         <button class="btn btn-sm btn-secondary" onclick="switchRoutineTab('weekly')" id="routine-tab-weekly">Weekly</button>
         <button class="btn btn-sm btn-secondary" onclick="switchRoutineTab('monthly')" id="routine-tab-monthly">Monthly</button>
+        <button class="btn btn-sm btn-secondary" onclick="switchRoutineTab('three_months')" id="routine-tab-three_months">3 Months</button>
         <select class="filter-select" id="routine-user-filter" style="display:none;margin-left:auto" onchange="renderRoutineTasks()">
           <option value="all">All Employees</option>
           <option value="de">Dev</option>
@@ -2946,7 +2947,7 @@ function initRoutinePage(){
 function switchRoutineTab(tab){
   currentRoutineTab=tab;
   showingRoutineArchive=false;
-  ['daily','weekly','monthly'].forEach(t=>{
+  ['daily','weekly','monthly','three_months'].forEach(t=>{
     const btn=document.getElementById('routine-tab-'+t);
     if(btn) btn.className='btn btn-sm '+(t===tab?'btn-primary':'btn-secondary');
   });
@@ -2969,6 +2970,11 @@ function getRoutineDueDate(frequency){
     const mon=new Date(now);
     mon.setDate(now.getDate()-(day===0?6:day-1));
     return mon.toISOString().split('T')[0];
+  }
+  if(frequency==='monthly') return d.substring(0,8)+'01';
+  if(frequency==='three_months'){
+    const q=Math.floor(now.getMonth()/3)*3;
+    return `${now.getFullYear()}-${String(q+1).padStart(2,'0')}-01`;
   }
   return d.substring(0,8)+'01';
 }
@@ -3033,52 +3039,63 @@ function checkRoutineReappear(){
   const now=new Date();
   const activeTasks=DB.routineTasks.filter(t=>t.active && !t.archived);
   for(const rt of activeTasks){
-    const dueDate=getRoutineDueDate(rt.frequency);
-    const exists=DB.routineCompletions.find(c=>c.taskId===rt.id && c.dueDate===dueDate && c.status==='pending');
-    if(!exists){
-      const lastComp=DB.routineCompletions.filter(c=>c.taskId===rt.id && c.status==='completed').sort((a,b)=>new Date(b.completedAt)-new Date(a.completedAt))[0];
-      if(lastComp){
-        let shouldReappear=false;
-        let newDeadline='';
-        let newDeadlineTime=rt.deadlineTime||'17:00';
-        if(rt.frequency==='daily'){
-          const compDate=new Date(lastComp.completedAt);
-          const reappearTime=new Date(compDate);
-          reappearTime.setHours(20,0,0,0);
-          if(now>=reappearTime || now.toISOString().split('T')[0]>lastComp.dueDate){
-            shouldReappear=true;
-            newDeadline=now.toISOString().split('T')[0];
-          }
-        } else if(rt.frequency==='weekly'){
-          const day=now.getDay();
-          const mon=new Date(now);
-          mon.setDate(now.getDate()-(day===0?6:day-1));
-          mon.setHours(7,0,0,0);
-          if(now>=mon && lastComp.dueDate<mon.toISOString().split('T')[0]){
-            shouldReappear=true;
-            const fri=new Date(mon);
-            fri.setDate(fri.getDate()+4);
-            newDeadline=fri.toISOString().split('T')[0];
-          }
-        } else if(rt.frequency==='monthly'){
-          const monthStart=now.toISOString().split('T')[0].substring(0,8)+'01';
-          if(lastComp.dueDate<monthStart){
-            const y=now.getFullYear();
-            const m=now.getMonth();
-            const lastDay=new Date(y,m+1,0).getDate();
-            newDeadline=`${y}-${String(m+1).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
-            shouldReappear=true;
-          }
-        }
-        if(shouldReappear){
-          const newDue=getRoutineDueDate(rt.frequency);
-          const alreadyExists=DB.routineCompletions.find(c=>c.taskId===rt.id && c.dueDate===newDue && c.status==='pending');
-          if(!alreadyExists){
-            const comp={id:'rc_'+Date.now()+'_'+Math.random().toString(36).substr(2,5), taskId:rt.id, dueDate:newDue, completedAt:null, completedBy:null, status:'pending', deadlineDate:newDeadline||rt.deadlineDate||'', deadlineTime:newDeadlineTime, autoArchiveAt:null};
-            DB.routineCompletions.push(comp);
-            sb.from('ff_recurring_completions').insert({id:comp.id, task_id:comp.taskId, due_date:comp.dueDate, completed_at:null, completed_by:null, status:'pending', deadline_date:comp.deadlineDate, deadline_time:comp.deadlineTime, auto_archive_at:null}).then(()=>{});
-          }
-        }
+    const hasPending=DB.routineCompletions.find(c=>c.taskId===rt.id && (c.status==='pending'||c.status==='urgent') && !c._archived);
+    if(hasPending) continue;
+    const lastComp=DB.routineCompletions.filter(c=>c.taskId===rt.id && c.status==='completed').sort((a,b)=>new Date(b.completedAt)-new Date(a.completedAt))[0];
+    if(!lastComp) continue;
+    let shouldReappear=false;
+    let newDeadline='';
+    let newDue='';
+    let newDeadlineTime=rt.deadlineTime||'17:00';
+
+    if(rt.frequency==='daily'){
+      const compDate=new Date(lastComp.completedAt);
+      const reappearTime=new Date(compDate);
+      reappearTime.setHours(20,0,0,0);
+      if(now>=reappearTime || now.toISOString().split('T')[0]>lastComp.dueDate){
+        shouldReappear=true;
+        const tomorrow=new Date(now); tomorrow.setDate(tomorrow.getDate()+1);
+        newDeadline=tomorrow.toISOString().split('T')[0];
+        newDue=now.toISOString().split('T')[0];
+      }
+    } else if(rt.frequency==='weekly'){
+      const day=now.getDay();
+      const mon=new Date(now);
+      mon.setDate(now.getDate()-(day===0?6:day-1));
+      mon.setHours(7,0,0,0);
+      if(now>=mon && lastComp.dueDate<mon.toISOString().split('T')[0]){
+        shouldReappear=true;
+        const fri=new Date(mon); fri.setDate(fri.getDate()+4);
+        newDeadline=fri.toISOString().split('T')[0];
+        newDue=mon.toISOString().split('T')[0];
+      }
+    } else if(rt.frequency==='monthly'){
+      const curYear=now.getFullYear(), curMonth=now.getMonth();
+      const day28=new Date(curYear, curMonth, 28, 7, 0, 0);
+      const monthStart=now.toISOString().split('T')[0].substring(0,8)+'01';
+      if(lastComp.dueDate<monthStart && (now>=day28 || now.getDate()>=28)){
+        const lastDay=new Date(curYear, curMonth+1, 0).getDate();
+        newDeadline=`${curYear}-${String(curMonth+1).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
+        newDue=monthStart;
+        shouldReappear=true;
+      }
+    } else if(rt.frequency==='three_months'){
+      const curQ=Math.floor(now.getMonth()/3);
+      const qStart=`${now.getFullYear()}-${String(curQ*3+1).padStart(2,'0')}-01`;
+      if(lastComp.dueDate<qStart){
+        const m=curQ*3;
+        const lastDay=new Date(now.getFullYear(),m+3,0).getDate();
+        newDeadline=`${now.getFullYear()}-${String(m+3).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
+        newDue=qStart;
+        shouldReappear=true;
+      }
+    }
+    if(shouldReappear && newDue){
+      const alreadyExists=DB.routineCompletions.find(c=>c.taskId===rt.id && c.dueDate===newDue && (c.status==='pending'||c.status==='urgent'));
+      if(!alreadyExists){
+        const comp={id:'rc_'+Date.now()+'_'+Math.random().toString(36).substr(2,5), taskId:rt.id, dueDate:newDue, completedAt:null, completedBy:null, status:'pending', deadlineDate:newDeadline||rt.deadlineDate||'', deadlineTime:newDeadlineTime, autoArchiveAt:null};
+        DB.routineCompletions.push(comp);
+        sb.from('ff_recurring_completions').insert({id:comp.id, task_id:comp.taskId, due_date:comp.dueDate, completed_at:null, completed_by:null, status:'pending', deadline_date:comp.deadlineDate, deadline_time:comp.deadlineTime, auto_archive_at:null}).then(()=>{});
       }
     }
   }
@@ -3100,11 +3117,12 @@ function renderRoutineTasks(){
   }
 
   const dueDate=getRoutineDueDate(currentRoutineTab);
-  const periodLabel=currentRoutineTab==='daily'?'Today':currentRoutineTab==='weekly'?'This Week':'This Month';
+  const periodLabel=currentRoutineTab==='daily'?'Today':currentRoutineTab==='weekly'?'This Week':currentRoutineTab==='three_months'?'This Quarter':'This Month';
 
   let taskRows=[];
   for(const rt of tasks){
-    const comp=DB.routineCompletions.find(c=>c.taskId===rt.id && c.dueDate===dueDate);
+    let comp=DB.routineCompletions.find(c=>c.taskId===rt.id && c.dueDate===dueDate);
+    if(!comp) comp=DB.routineCompletions.filter(c=>c.taskId===rt.id && !c._archived).sort((a,b)=>b.dueDate.localeCompare(a.dueDate))[0];
     const status=comp?comp.status:'pending';
     const isDone=status==='completed';
     const isUrgent=status==='urgent';
@@ -3251,6 +3269,7 @@ async function toggleRoutineTask(taskId, dueDate, checked){
     if(rt.frequency==='daily') archiveDelay=3*60*60*1000;
     else if(rt.frequency==='weekly') archiveDelay=2*24*60*60*1000;
     else if(rt.frequency==='monthly') archiveDelay=5*24*60*60*1000;
+    else if(rt.frequency==='three_months') archiveDelay=5*24*60*60*1000;
     const archiveAt=new Date(Date.now()+archiveDelay).toISOString();
     comp.autoArchiveAt=archiveAt;
 
@@ -3277,13 +3296,17 @@ async function toggleRoutineTask(taskId, dueDate, checked){
 async function spawnNextRoutineOccurrence(rt){
   let nextDeadline='';
   let nextDue='';
+  let appearAt=null;
   const now=new Date();
 
   if(rt.frequency==='daily'){
     const tomorrow=new Date(now);
     tomorrow.setDate(tomorrow.getDate()+1);
     nextDeadline=tomorrow.toISOString().split('T')[0];
-    nextDue=nextDeadline;
+    nextDue=tomorrow.toISOString().split('T')[0];
+    appearAt=new Date(now);
+    appearAt.setHours(20,0,0,0);
+    if(now>=appearAt) appearAt=now;
   } else if(rt.frequency==='weekly'){
     const day=now.getDay();
     const nextMon=new Date(now);
@@ -3293,17 +3316,36 @@ async function spawnNextRoutineOccurrence(rt){
     nextFri.setDate(nextFri.getDate()+4);
     nextDeadline=nextFri.toISOString().split('T')[0];
     nextDue=nextMon.toISOString().split('T')[0];
+    appearAt=nextMon;
   } else if(rt.frequency==='monthly'){
-    const y=now.getMonth()===11?now.getFullYear()+1:now.getFullYear();
-    const m=now.getMonth()===11?0:now.getMonth()+1;
+    const curMonth=now.getMonth();
+    const curYear=now.getFullYear();
+    const appear28=new Date(curYear, curMonth, 28, 7, 0, 0);
+    let targetMonth, targetYear;
+    if(now.getDate()<28){
+      targetMonth=curMonth+1; targetYear=curYear;
+    } else {
+      targetMonth=curMonth+2; targetYear=curYear;
+    }
+    if(targetMonth>11){targetMonth-=12; targetYear++;}
+    const lastDay=new Date(targetYear, targetMonth+1, 0).getDate();
+    nextDeadline=`${targetYear}-${String(targetMonth+1).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
+    nextDue=`${targetYear}-${String(targetMonth+1).padStart(2,'0')}-01`;
+    appearAt=now.getDate()<28?appear28:now;
+  } else if(rt.frequency==='three_months'){
+    const curQ=Math.floor(now.getMonth()/3);
+    let nextQ=curQ+1, y=now.getFullYear();
+    if(nextQ>3){nextQ=0;y++;}
+    const m=nextQ*3;
+    const lastDay=new Date(y,m+3,0).getDate();
     nextDue=`${y}-${String(m+1).padStart(2,'0')}-01`;
-    const lastDay=new Date(y,m+1,0).getDate();
-    nextDeadline=`${y}-${String(m+1).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
+    nextDeadline=`${y}-${String(m+3).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
+    appearAt=now;
   }
 
   const alreadyExists=DB.routineCompletions.find(c=>c.taskId===rt.id && c.dueDate===nextDue && (c.status==='pending'||c.status==='urgent'));
   if(!alreadyExists && nextDue){
-    const comp={id:'rc_'+Date.now()+'_'+Math.random().toString(36).substr(2,5), taskId:rt.id, dueDate:nextDue, completedAt:null, completedBy:null, status:'pending', deadlineDate:nextDeadline, deadlineTime:rt.deadlineTime||'17:00', autoArchiveAt:null};
+    const comp={id:'rc_'+Date.now()+'_'+Math.random().toString(36).substr(2,5), taskId:rt.id, dueDate:nextDue, completedAt:null, completedBy:null, status:'pending', deadlineDate:nextDeadline, deadlineTime:rt.deadlineTime||'17:00', autoArchiveAt:null, appearAt:appearAt?appearAt.toISOString():null};
     DB.routineCompletions.push(comp);
     await sb.from('ff_recurring_completions').insert({id:comp.id, task_id:comp.taskId, due_date:comp.dueDate, completed_at:null, completed_by:null, status:'pending', deadline_date:comp.deadlineDate, deadline_time:comp.deadlineTime, auto_archive_at:null});
   }
@@ -3338,7 +3380,7 @@ function showAddRoutineTask(){
     ${assignField}
     <div><label style="font-size:12px;font-weight:600;color:var(--text2)">Frequency</label>
       <select id="rt-frequency" class="filter-select" style="width:100%">
-        <option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option>
+        <option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option><option value="three_months">Every 3 Months</option>
       </select></div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
       <div><label style="font-size:12px;font-weight:600;color:var(--text2)">Deadline Date *</label>
@@ -3423,7 +3465,7 @@ function viewRoutineTask(id){
   const dueDate=getRoutineDueDate(rt.frequency);
   const comp=DB.routineCompletions.find(c=>c.taskId===rt.id && c.dueDate===dueDate);
   const status=comp?comp.status:'pending';
-  const freqLabel=rt.frequency.charAt(0).toUpperCase()+rt.frequency.slice(1);
+  const freqLabel=rt.frequency==='three_months'?'Every 3 Months':rt.frequency.charAt(0).toUpperCase()+rt.frequency.slice(1);
 
   const dlDate=comp?.deadlineDate||rt.deadlineDate||'';
   const dlTime=comp?.deadlineTime||rt.deadlineTime||'17:00';
@@ -3451,6 +3493,7 @@ function viewRoutineTask(id){
         <option value="daily" ${rt.frequency==='daily'?'selected':''}>Daily</option>
         <option value="weekly" ${rt.frequency==='weekly'?'selected':''}>Weekly</option>
         <option value="monthly" ${rt.frequency==='monthly'?'selected':''}>Monthly</option>
+        <option value="three_months" ${rt.frequency==='three_months'?'selected':''}>Every 3 Months</option>
       </select>`:`<div style="font-weight:600;margin-top:2px">${freqLabel}</div>`;
 
   const reminderField=isManager?`<input type="time" id="rt-edit-reminder" value="${rt.reminderTime}" style="width:100%;padding:4px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;background:var(--surface);color:var(--text);margin-top:2px">`
@@ -3698,7 +3741,7 @@ async function importRoutineTasks(input){
 let routineReminderInterval=null;
 function startRoutineReminders(){
   if(routineReminderInterval) clearInterval(routineReminderInterval);
-  routineReminderInterval=setInterval(()=>{checkRoutineReminders();checkAutoRoutineEOD();}, 60000);
+  routineReminderInterval=setInterval(()=>{checkRoutineReminders();checkAutoRoutineEOD();checkAutoArchiveRoutines();checkRoutineReappear();renderRoutineTasks();}, 60000);
   checkRoutineReminders();
 }
 
@@ -3734,7 +3777,7 @@ function checkAutoRoutineEOD(){
 }
 
 function showRoutineReminder(rt){
-  const freqLabel=rt.frequency.charAt(0).toUpperCase()+rt.frequency.slice(1);
+  const freqLabel=rt.frequency==='three_months'?'Every 3 Months':rt.frequency.charAt(0).toUpperCase()+rt.frequency.slice(1);
   openModal('⏰ Routine Task Reminder', `
     <div style="text-align:center;padding:20px">
       <div style="font-size:48px;margin-bottom:12px">🔔</div>
@@ -3754,11 +3797,12 @@ async function sendRoutineEODEmail(){
     const todayDue=getRoutineDueDate('daily');
     const weekDue=getRoutineDueDate('weekly');
     const monthDue=getRoutineDueDate('monthly');
+    const qDue=getRoutineDueDate('three_months');
 
     let rows='';
     let doneCount=0, odCount=0;
     for(const rt of myTasks){
-      const due=rt.frequency==='daily'?todayDue:rt.frequency==='weekly'?weekDue:monthDue;
+      const due=rt.frequency==='daily'?todayDue:rt.frequency==='weekly'?weekDue:rt.frequency==='three_months'?qDue:monthDue;
       const comp=DB.routineCompletions.find(c=>c.taskId===rt.id && c.dueDate===due);
       const st=comp?comp.status:'pending';
       if(st==='completed') doneCount++;
