@@ -1224,6 +1224,7 @@ async function initApp(){
   }
   if(toAutoDelete.length) showToast(`${toAutoDelete.length} old completed task(s) auto-removed`,'info');
   await snapshotDailySummary();
+  await checkMainTaskRecurrence();
   ensureRoutineCompletions();
   startRoutineReminders();
   setInterval(checkAutoMorningReport, 60000);
@@ -1938,6 +1939,48 @@ async function createRecurringOccurrence(d){
   };
   DB.tasks.push(newTask);
   await dbInsertTask(newTask);
+}
+
+async function checkMainTaskRecurrence(){
+  const now=new Date();
+  const completedRecurring=DB.tasks.filter(t=>t.status==='Completed' && t.isRecurring && t.recurrenceType && t.completionDate);
+  for(const t of completedRecurring){
+    const compDate=new Date(t.completionDate);
+    const hasNext=DB.tasks.find(x=>x.isRecurring && x.recurrenceType===t.recurrenceType && x.title===t.title && x.assignedTo===t.assignedTo && x.status!=='Completed' && x.id!==t.id);
+    if(hasNext) continue;
+
+    let shouldSpawn=false;
+    if(t.recurrenceType==='daily'){
+      const reappear=new Date(compDate); reappear.setHours(20,0,0,0);
+      if(now>=reappear || now.toISOString().split('T')[0]>compDate.toISOString().split('T')[0]) shouldSpawn=true;
+    } else if(t.recurrenceType==='weekly'){
+      const day=now.getDay();
+      const mon=new Date(now); mon.setDate(now.getDate()-(day===0?6:day-1)); mon.setHours(7,0,0,0);
+      if(now>=mon && compDate<mon) shouldSpawn=true;
+    } else if(t.recurrenceType==='monthly'){
+      const appear28=new Date(now.getFullYear(), now.getMonth(), 28, 0, 0, 0);
+      if(now>=appear28 && compDate<appear28) shouldSpawn=true;
+      if(now.getMonth()!==compDate.getMonth()||now.getFullYear()!==compDate.getFullYear()) shouldSpawn=true;
+    } else if(t.recurrenceType==='quarterly'){
+      const compQ=Math.floor(compDate.getMonth()/3);
+      const nowQ=Math.floor(now.getMonth()/3);
+      if(nowQ!==compQ || now.getFullYear()!==compDate.getFullYear()) shouldSpawn=true;
+    }
+    if(shouldSpawn) await spawnNextMainTask(t);
+
+    const archiveDelays={daily:3*60*60*1000, weekly:2*24*60*60*1000, monthly:5*24*60*60*1000, quarterly:5*24*60*60*1000, annually:5*24*60*60*1000};
+    const delay=archiveDelays[t.recurrenceType]||5*24*60*60*1000;
+    if(now.getTime()-compDate.getTime()>=delay){
+      const idx=DB.tasks.findIndex(x=>x.id===t.id);
+      if(idx!==-1){
+        const task=DB.tasks.splice(idx,1)[0];
+        const archived={...task, deletedBy:'system', deletedDate:new Date().toISOString()};
+        DB.recycleBin.push(archived);
+        await dbDeleteTask(t.id);
+        await dbInsertRecycleBin(archived);
+      }
+    }
+  }
 }
 
 async function archiveTask(tid){
@@ -3741,7 +3784,7 @@ async function importRoutineTasks(input){
 let routineReminderInterval=null;
 function startRoutineReminders(){
   if(routineReminderInterval) clearInterval(routineReminderInterval);
-  routineReminderInterval=setInterval(()=>{checkRoutineReminders();checkAutoRoutineEOD();checkAutoArchiveRoutines();checkRoutineReappear();renderRoutineTasks();}, 60000);
+  routineReminderInterval=setInterval(()=>{checkRoutineReminders();checkAutoRoutineEOD();checkAutoArchiveRoutines();checkRoutineReappear();checkMainTaskRecurrence();renderRoutineTasks();renderTasks();renderDashboard();}, 60000);
   checkRoutineReminders();
 }
 
