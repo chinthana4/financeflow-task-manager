@@ -1092,93 +1092,6 @@ function isOverdue(task){
 
 
 // ═══════════════════════════════════════════════════════
-// GRAMMAR CHECKER
-// ═══════════════════════════════════════════════════════
-const GRAMMAR_RULES=[
-  {regex:/\b(i)\b(?![.'])/g, fix:'I', msg:'Capitalize "I"'},
-  {regex:/\b(dont)\b/gi, fix:"don't", msg:'Missing apostrophe'},
-  {regex:/\b(cant)\b/gi, fix:"can't", msg:'Missing apostrophe'},
-  {regex:/\b(wont)\b/gi, fix:"won't", msg:'Missing apostrophe'},
-  {regex:/\b(didnt)\b/gi, fix:"didn't", msg:'Missing apostrophe'},
-  {regex:/\b(doesnt)\b/gi, fix:"doesn't", msg:'Missing apostrophe'},
-  {regex:/\b(isnt)\b/gi, fix:"isn't", msg:'Missing apostrophe'},
-  {regex:/\b(arent)\b/gi, fix:"aren't", msg:'Missing apostrophe'},
-  {regex:/\b(wasnt)\b/gi, fix:"wasn't", msg:'Missing apostrophe'},
-  {regex:/\b(werent)\b/gi, fix:"weren't", msg:'Missing apostrophe'},
-  {regex:/\b(havent)\b/gi, fix:"haven't", msg:'Missing apostrophe'},
-  {regex:/\b(hasnt)\b/gi, fix:"hasn't", msg:'Missing apostrophe'},
-  {regex:/\b(wouldnt)\b/gi, fix:"wouldn't", msg:'Missing apostrophe'},
-  {regex:/\b(couldnt)\b/gi, fix:"couldn't", msg:'Missing apostrophe'},
-  {regex:/\b(shouldnt)\b/gi, fix:"shouldn't", msg:'Missing apostrophe'},
-  {regex:/\b(thier)\b/gi, fix:'their', msg:'Spelling: their'},
-  {regex:/\b(recieve)\b/gi, fix:'receive', msg:'Spelling: receive'},
-  {regex:/\b(occured)\b/gi, fix:'occurred', msg:'Spelling: occurred'},
-  {regex:/\b(seperate)\b/gi, fix:'separate', msg:'Spelling: separate'},
-  {regex:/\b(untill)\b/gi, fix:'until', msg:'Spelling: until'},
-  {regex:/\b(definately)\b/gi, fix:'definitely', msg:'Spelling: definitely'},
-  {regex:/\b(accomodate)\b/gi, fix:'accommodate', msg:'Spelling: accommodate'},
-  {regex:/\b(occurance)\b/gi, fix:'occurrence', msg:'Spelling: occurrence'},
-  {regex:/\b(neccessary)\b/gi, fix:'necessary', msg:'Spelling: necessary'},
-  {regex:/\b(teh)\b/gi, fix:'the', msg:'Spelling: the'},
-  {regex:/\b(adn)\b/gi, fix:'and', msg:'Spelling: and'},
-  {regex:/\b(hte)\b/gi, fix:'the', msg:'Spelling: the'},
-  {regex:/\s{2,}/g, fix:' ', msg:'Extra spaces'},
-];
-
-function checkGrammar(text){
-  const issues=[];
-  for(const rule of GRAMMAR_RULES){
-    let m;
-    const r=new RegExp(rule.regex.source, rule.regex.flags);
-    while((m=r.exec(text))!==null){
-      issues.push({index:m.index, original:m[0], fix:rule.fix, msg:rule.msg});
-    }
-  }
-  return issues;
-}
-
-function applyGrammarFix(inputId){
-  const el=document.getElementById(inputId);
-  if(!el) return;
-  let text=el.value;
-  for(const rule of GRAMMAR_RULES){
-    text=text.replace(new RegExp(rule.regex.source, rule.regex.flags), rule.fix);
-  }
-  el.value=text;
-  const hint=document.getElementById(inputId+'-grammar-hint');
-  if(hint) hint.innerHTML='<span style="color:#22c55e;font-size:11px">✅ Grammar checked</span>';
-}
-
-function setupGrammarCheck(inputId){
-  const el=document.getElementById(inputId);
-  if(!el) return;
-  let timer;
-  const hintId=inputId+'-grammar-hint';
-  if(!document.getElementById(hintId)){
-    const hint=document.createElement('div');
-    hint.id=hintId;
-    hint.style.cssText='min-height:18px;margin-top:2px';
-    el.parentElement.appendChild(hint);
-  }
-  el.addEventListener('input',()=>{
-    clearTimeout(timer);
-    timer=setTimeout(()=>{
-      const issues=checkGrammar(el.value);
-      const hint=document.getElementById(hintId);
-      if(hint){
-        if(issues.length){
-          hint.innerHTML=`<span style="color:#f59e0b;font-size:11px">⚠️ ${issues.length} suggestion(s) — <a href="#" onclick="event.preventDefault();applyGrammarFix('${inputId}')" style="color:var(--primary);text-decoration:underline">Auto-fix</a></span>`;
-        } else if(el.value.trim()){
-          hint.innerHTML='<span style="color:#22c55e;font-size:11px">✅ Looks good</span>';
-        } else {
-          hint.innerHTML='';
-        }
-      }
-    },800);
-  });
-}
-
-// ═══════════════════════════════════════════════════════
 // AUTH
 // ═══════════════════════════════════════════════════════
 function login(){
@@ -1481,7 +1394,6 @@ function openNewTask(){
     {label:'Cancel', action:'closeModal()', cls:'btn-secondary'},
     {label:'Create Task', action:'createTask()', cls:'btn-primary'}
   ]);
-  setTimeout(()=>{setupGrammarCheck('nt-title');setupGrammarCheck('nt-desc');},100);
 }
 
 function addStep(listId, inputId){
@@ -3152,6 +3064,7 @@ function renderRoutineTasks(){
   const filterUser=isManager?(document.getElementById('routine-user-filter')?.value||'all'):null;
 
   let tasks=DB.routineTasks.filter(t=>t.active && !t.archived && t.frequency===currentRoutineTab);
+  if(currentUser==='de'||currentUser==='mitiksha') tasks=tasks.filter(t=>t.assignedTo===currentUser);
   if(isManager && filterUser!=='all') tasks=tasks.filter(t=>t.assignedTo===filterUser);
 
   if(!tasks.length){
