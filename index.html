@@ -1320,30 +1320,16 @@ function navigateTo(pageId){
 // ═══════════════════════════════════════════════════════
 function renderDashboard(){
   const tasks = (currentUser==='sumudu'||currentUser==='trupal') ? DB.tasks.filter(t=>t.assignedTo==='de'||t.assignedTo==='mitiksha') : DB.tasks.filter(t=>t.assignedTo===currentUser);
-
-  // Include routine tasks in dashboard stats
-  const myRoutines=(currentUser==='sumudu'||currentUser==='trupal')?DB.routineTasks.filter(t=>t.active&&!t.archived):DB.routineTasks.filter(t=>t.active&&!t.archived&&t.assignedTo===currentUser);
-  let rPending=0, rDone=0, rOverdue=0;
-  for(const rt of myRoutines){
-    const due=getRoutineDueDate(rt.frequency);
-    let comp=DB.routineCompletions.find(c=>c.taskId===rt.id && c.dueDate===due);
-    if(!comp) comp=DB.routineCompletions.filter(c=>c.taskId===rt.id && !c._archived && (c.status==='pending'||c.status==='urgent')).sort((a,b)=>b.dueDate.localeCompare(a.dueDate))[0];
-    const st=comp?comp.status:'pending';
-    if(st==='completed') rDone++;
-    else if(st==='urgent'||st==='overdue') rOverdue++;
-    else rPending++;
-  }
-
-  const pending = tasks.filter(t=>t.status==='Pending').length + rPending;
+  const pending = tasks.filter(t=>t.status==='Pending').length;
   const inprog  = tasks.filter(t=>t.status==='In Progress').length;
-  const done    = tasks.filter(t=>t.status==='Completed').length + rDone;
-  const overdue = tasks.filter(t=>t.status==='Overdue').length + rOverdue;
+  const done    = tasks.filter(t=>t.status==='Completed').length;
+  const overdue = tasks.filter(t=>t.status==='Overdue').length;
 
   // Motivation banner
   const motivHtml=`<div class="dash-motivation"><span class="motiv-icon">✨</span><span>${getMotivation()} ✨</span></div>`;
 
   const statData = [
-    {label:'Total Tasks',value:tasks.length+myRoutines.length,color:'#4a3aaf',bg:'#5b4dc7',icon:'<svg width="22" height="22" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M8 7h8M8 12h5M8 17h8"/></svg>'},
+    {label:'Total Tasks',value:tasks.length,color:'#4a3aaf',bg:'#5b4dc7',icon:'<svg width="22" height="22" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M8 7h8M8 12h5M8 17h8"/></svg>'},
     {label:'Pending',value:pending,color:'#c88d0a',bg:'#e5a819',icon:'<svg width="22" height="22" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>'},
     {label:'Completed',value:done,color:'#16864a',bg:'#21a85e',icon:'<svg width="22" height="22" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8 12l3 3 5-5"/></svg>'},
     {label:'Overdue',value:overdue,color:'#c42828',bg:'#e53e3e',icon:'<svg width="22" height="22" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" viewBox="0 0 24 24"><path d="M12 2L2 20h20L12 2z"/><path d="M12 10v4M12 17h.01"/></svg>'},
