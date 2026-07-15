@@ -1748,18 +1748,6 @@ async function markComplete(tid){
   await snapshotDailySummary();
   if(t.isRecurring && t.recurrenceType){
     await spawnNextMainTask(t);
-    const archiveDelays={daily:3*60*60*1000, weekly:2*24*60*60*1000, monthly:5*24*60*60*1000, quarterly:5*24*60*60*1000, annually:5*24*60*60*1000};
-    const delay=archiveDelays[t.recurrenceType]||5*24*60*60*1000;
-    setTimeout(async()=>{
-      const idx=DB.tasks.findIndex(x=>x.id===tid);
-      if(idx===-1) return;
-      const task=DB.tasks.splice(idx,1)[0];
-      const archived={...task, deletedBy:'system', deletedDate:new Date().toISOString()};
-      DB.recycleBin.push(archived);
-      await dbDeleteTask(tid);
-      await dbInsertRecycleBin(archived);
-      renderTasks(); renderMyTasks(); renderDashboard();
-    }, delay);
   }
   showToast('Task completed!','success');
   renderTasks(); renderMyTasks(); renderDashboard();
@@ -1876,22 +1864,6 @@ async function checkMainTaskRecurrence(){
     if(shouldSpawn) await spawnNextMainTask(t);
   }
 
-  // Auto-archive completed recurring tasks after their delay period
-  for(const t of completedRecurring){
-    const compDate=new Date(t.completionDate);
-    const archiveDelays={daily:3*60*60*1000, weekly:2*24*60*60*1000, monthly:5*24*60*60*1000, quarterly:5*24*60*60*1000, annually:5*24*60*60*1000};
-    const delay=archiveDelays[t.recurrenceType]||5*24*60*60*1000;
-    if(now.getTime()-compDate.getTime()>=delay){
-      const idx=DB.tasks.findIndex(x=>x.id===t.id);
-      if(idx!==-1){
-        const task=DB.tasks.splice(idx,1)[0];
-        const archived={...task, deletedBy:'system', deletedDate:new Date().toISOString()};
-        DB.recycleBin.push(archived);
-        await dbDeleteTask(t.id);
-        await dbInsertRecycleBin(archived);
-      }
-    }
-  }
 }
 
 async function archiveTask(tid){
