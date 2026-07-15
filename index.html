@@ -1124,18 +1124,6 @@ async function initApp(){
   const hasLocal=localStorage.getItem('ffdb');
   document.getElementById('migrate-btn').style.display = hasLocal?'':'none';
   await loadDB();
-  for(const t of DB.tasks){ if(isOverdue(t) && t.status!=='Overdue'){ t.status='Overdue'; await dbUpdateTask(t); } }
-  // Auto-delete completed tasks older than 1 month
-  const oneMonthAgo = new Date();
-  oneMonthAgo.setMonth(oneMonthAgo.getMonth()-1);
-  const oneMonthStr = oneMonthAgo.toISOString().split('T')[0];
-  const toAutoDelete = DB.tasks.filter(t=>t.status==='Completed' && t.completionDate && t.completionDate < oneMonthStr);
-  for(const t of toAutoDelete){
-    const idx=DB.tasks.findIndex(x=>x.id===t.id);
-    if(idx!==-1) DB.tasks.splice(idx,1);
-    await dbDeleteTask(t.id);
-  }
-  if(toAutoDelete.length) showToast(`${toAutoDelete.length} old completed task(s) auto-removed`,'info');
   await snapshotDailySummary();
   await checkMainTaskRecurrence();
   ensureRoutineCompletions();
@@ -1855,9 +1843,16 @@ async function createRecurringOccurrence(d){
 
 async function checkMainTaskRecurrence(){
   const now=new Date();
+
+  // Check completed recurring tasks still in main list
   const completedRecurring=DB.tasks.filter(t=>t.status==='Completed' && t.isRecurring && t.recurrenceType && t.completionDate);
-  for(const t of completedRecurring){
+  // Also check archived recurring tasks in recycle bin
+  const archivedRecurring=DB.recycleBin.filter(t=>t.isRecurring && t.recurrenceType && t.completionDate && t.status==='Completed');
+  const allCompleted=[...completedRecurring, ...archivedRecurring];
+
+  for(const t of allCompleted){
     const compDate=new Date(t.completionDate);
+    // Check if a pending occurrence already exists
     const hasNext=DB.tasks.find(x=>x.isRecurring && x.recurrenceType===t.recurrenceType && x.title===t.title && x.assignedTo===t.assignedTo && x.status!=='Completed' && x.id!==t.id);
     if(hasNext) continue;
 
@@ -1879,7 +1874,11 @@ async function checkMainTaskRecurrence(){
       if(nowQ!==compQ || now.getFullYear()!==compDate.getFullYear()) shouldSpawn=true;
     }
     if(shouldSpawn) await spawnNextMainTask(t);
+  }
 
+  // Auto-archive completed recurring tasks after their delay period
+  for(const t of completedRecurring){
+    const compDate=new Date(t.completionDate);
     const archiveDelays={daily:3*60*60*1000, weekly:2*24*60*60*1000, monthly:5*24*60*60*1000, quarterly:5*24*60*60*1000, annually:5*24*60*60*1000};
     const delay=archiveDelays[t.recurrenceType]||5*24*60*60*1000;
     if(now.getTime()-compDate.getTime()>=delay){
