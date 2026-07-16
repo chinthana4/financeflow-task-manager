@@ -1832,13 +1832,9 @@ async function createRecurringOccurrence(d){
 async function checkMainTaskRecurrence(){
   const now=new Date();
 
-  // Check completed recurring tasks still in main list
   const completedRecurring=DB.tasks.filter(t=>t.status==='Completed' && t.isRecurring && t.recurrenceType && t.completionDate);
-  // Also check archived recurring tasks in recycle bin
-  const archivedRecurring=DB.recycleBin.filter(t=>t.isRecurring && t.recurrenceType && t.completionDate && t.status==='Completed');
-  const allCompleted=[...completedRecurring, ...archivedRecurring];
 
-  for(const t of allCompleted){
+  for(const t of completedRecurring){
     const compDate=new Date(t.completionDate);
     // Check if a pending occurrence already exists
     const hasNext=DB.tasks.find(x=>x.isRecurring && x.recurrenceType===t.recurrenceType && x.title===t.title && x.assignedTo===t.assignedTo && x.status!=='Completed' && x.id!==t.id);
@@ -3668,7 +3664,7 @@ async function importRoutineTasks(input){
 let routineReminderInterval=null;
 function startRoutineReminders(){
   if(routineReminderInterval) clearInterval(routineReminderInterval);
-  routineReminderInterval=setInterval(()=>{checkRoutineReminders();checkAutoRoutineEOD();checkAutoArchiveRoutines();checkRoutineReappear();checkMainTaskRecurrence();renderRoutineTasks();renderTasks();renderDashboard();}, 60000);
+  routineReminderInterval=setInterval(()=>{checkRoutineReminders();checkAutoRoutineEOD();checkAutoArchiveRoutines();checkRoutineReappear();renderRoutineTasks();}, 60000);
   checkRoutineReminders();
 }
 
