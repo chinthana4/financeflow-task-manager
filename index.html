@@ -1221,7 +1221,7 @@ function navigateTo(pageId){
 // DASHBOARD
 // ═══════════════════════════════════════════════════════
 function renderDashboard(){
-  const tasks = (currentUser==='sumudu'||currentUser==='trupal') ? DB.tasks.filter(t=>t.assignedTo==='de'||t.assignedTo==='mitiksha') : DB.tasks.filter(t=>t.assignedTo===currentUser);
+  const tasks = ((currentUser==='sumudu'||currentUser==='trupal') ? DB.tasks.filter(t=>t.assignedTo==='de'||t.assignedTo==='mitiksha') : DB.tasks.filter(t=>t.assignedTo===currentUser)).filter(t=>!t.isDocRequest);
   const pending = tasks.filter(t=>t.status==='Pending').length;
   const inprog  = tasks.filter(t=>t.status==='In Progress').length;
   const done    = tasks.filter(t=>t.status==='Completed').length;
@@ -1539,7 +1539,7 @@ async function uploadFilesToStorage(taskId, files){
 // RENDER TASKS TABLE
 // ═══════════════════════════════════════════════════════
 function getFilteredTasks(){
-  let tasks = [...DB.tasks];
+  let tasks = DB.tasks.filter(t=>!t.isDocRequest);
   if(currentUser==='de'){ tasks=tasks.filter(t=>t.assignedTo==='de'||t.assignedTo==='mitiksha'); }
   if(currentUser==='trupal'){ tasks=tasks.filter(t=>t.assignedTo==='de'||t.assignedTo==='mitiksha'); }
   if(currentUser==='mitiksha'){ tasks=tasks.filter(t=>t.assignedTo==='mitiksha'); }
