@@ -3093,7 +3093,7 @@ function renderRoutineTasks(){
     if(isDone && canMod){
       actionsHtml+=`<button class="btn btn-warning btn-sm" style="font-size:10px;padding:3px 6px" onclick="event.stopPropagation();archiveRoutineTask('${rt.id}')">📦</button>`;
     }
-    if(isManager){
+    if(canMod){
       actionsHtml+=`<button class="btn btn-danger btn-sm" style="font-size:10px;padding:3px 6px" onclick="event.stopPropagation();deleteRoutineTask('${rt.id}')">🗑️</button>`;
     }
     actionsHtml+='</div>';
@@ -3412,17 +3412,17 @@ function viewRoutineTask(id){
   const isManager=currentUser==='sumudu';
   const canMod=canModifyRoutineTask(rt);
 
-  const freqField=isManager?`<select id="rt-edit-freq" class="filter-select" style="width:100%;margin-top:2px">
+  const freqField=canMod?`<select id="rt-edit-freq" class="filter-select" style="width:100%;margin-top:2px">
         <option value="daily" ${rt.frequency==='daily'?'selected':''}>Daily</option>
         <option value="weekly" ${rt.frequency==='weekly'?'selected':''}>Weekly</option>
         <option value="monthly" ${rt.frequency==='monthly'?'selected':''}>Monthly</option>
         <option value="three_months" ${rt.frequency==='three_months'?'selected':''}>Every 3 Months</option>
       </select>`:`<div style="font-weight:600;margin-top:2px">${freqLabel}</div>`;
 
-  const reminderField=isManager?`<input type="time" id="rt-edit-reminder" value="${rt.reminderTime}" style="width:100%;padding:4px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;background:var(--surface);color:var(--text);margin-top:2px">`
+  const reminderField=canMod?`<input type="time" id="rt-edit-reminder" value="${rt.reminderTime}" style="width:100%;padding:4px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;background:var(--surface);color:var(--text);margin-top:2px">`
     :`<div style="font-weight:600;margin-top:2px">⏰ ${rt.reminderTime}</div>`;
 
-  const statusField=isManager?`<select id="rt-edit-status" class="filter-select" style="width:100%;margin-top:2px">
+  const statusField=canMod?`<select id="rt-edit-status" class="filter-select" style="width:100%;margin-top:2px">
         <option value="pending" ${status==='pending'||status==='urgent'?'selected':''}>Pending</option>
         <option value="completed" ${status==='completed'?'selected':''}>Completed</option>
       </select>`:`<div style="margin-top:4px">${statusBadge}</div>`;
@@ -3442,15 +3442,15 @@ function viewRoutineTask(id){
         <div style="font-weight:600;margin-top:2px">${USERS[rt.assignedTo]?.name||rt.assignedTo}</div>
       </div>
       <div>
-        <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px">Frequency${isManager?' ✏️':''}</div>
+        <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px">Frequency${canMod?' ✏️':''}</div>
         ${freqField}
       </div>
       <div>
-        <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px">Reminder${isManager?' ✏️':''}</div>
+        <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px">Reminder${canMod?' ✏️':''}</div>
         ${reminderField}
       </div>
       <div>
-        <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px">Status${isManager?' ✏️':''}</div>
+        <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px">Status${canMod?' ✏️':''}</div>
         ${statusField}
       </div>
     </div>
@@ -3489,7 +3489,7 @@ async function saveRoutineDetails(id){
   }
   const dbUpdate={remarks:rt.remarks, link:rt.link};
 
-  if(currentUser==='sumudu'){
+  if(canMod){
     const newFreq=document.getElementById('rt-edit-freq')?.value;
     const newReminder=document.getElementById('rt-edit-reminder')?.value;
     const newStatus=document.getElementById('rt-edit-status')?.value;
