@@ -3428,6 +3428,10 @@ function viewRoutineTask(id){
       </select>`:`<div style="margin-top:4px">${statusBadge}</div>`;
 
   const body=`<div style="display:flex;flex-direction:column;gap:16px">
+    ${canMod?`<div>
+      <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Title ✏️</div>
+      <input type="text" id="rt-edit-title" value="${escHtml(rt.title)}" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:15px;font-weight:600;background:var(--surface);color:var(--text)">
+    </div>`:''}
     <div style="background:var(--bg-subtle);padding:12px 16px;border-radius:var(--radius-sm);border-left:4px solid ${urgentNow?'#dc2626':'var(--primary)'}">
       <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px">Deadline ✏️</div>
       <div style="display:flex;gap:10px;align-items:center;margin-top:6px;flex-wrap:wrap">
@@ -3486,8 +3490,10 @@ async function saveRoutineDetails(id){
   if(canMod){
     rt.remarks=document.getElementById('rt-remarks')?.value||'';
     rt.link=document.getElementById('rt-link')?.value||'';
+    const newTitle=document.getElementById('rt-edit-title')?.value?.trim();
+    if(newTitle && newTitle!==rt.title) rt.title=newTitle;
   }
-  const dbUpdate={remarks:rt.remarks, link:rt.link};
+  const dbUpdate={remarks:rt.remarks, link:rt.link, title:rt.title};
 
   if(canMod){
     const newFreq=document.getElementById('rt-edit-freq')?.value;
