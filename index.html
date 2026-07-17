@@ -1816,6 +1816,8 @@ async function spawnNextMainTask(t){
 }
 
 async function createRecurringOccurrence(d){
+  const exists=DB.tasks.find(x=>x.isRecurring && x.title===d.title && x.assignedTo===d.assignedTo && x.recurrenceType===d.recurrenceType && x.status!=='Completed');
+  if(exists) return;
   const newTask={
     id:'task_'+Date.now()+'_'+Math.random().toString(36).substr(2,5),
     title:d.title, description:d.description, assignedTo:d.assignedTo,
