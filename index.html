@@ -914,6 +914,11 @@ const USERS = {
 // Reverse lookup: auth email -> short username, so a restored session resolves to currentUser.
 const EMAIL_TO_USERNAME = Object.fromEntries(Object.entries(USERS).map(([u, d]) => [d.email.toLowerCase(), u]));
 
+// View-only users (Trupal) are read-only. The database enforces this via RLS;
+// this client check just avoids firing background writes that would be denied.
+const VIEW_ONLY_USERS = ['trupal'];
+function canWrite(){ return !!currentUser && !VIEW_ONLY_USERS.includes(currentUser); }
+
 const MOTIVATIONS = [
   "You're doing amazing today!","Every task completed is progress!",
   "Success comes from consistency!","You're the best!",
@@ -1007,6 +1012,7 @@ async function loadDB(){
 function saveDB(){}
 
 async function snapshotDailySummary(){
+  if(!canWrite()) return; // view-only users don't write daily stats
   const d=today();
   for(const uid of ['de','mitiksha']){
     const completed=DB.tasks.filter(t=>t.assignedTo===uid&&t.completionDate&&t.completionDate.startsWith(d)).length;
@@ -1870,6 +1876,7 @@ async function createRecurringOccurrence(d){
 }
 
 async function checkMainTaskRecurrence(){
+  if(!canWrite()) return; // recurrence spawning is a write; skip for view-only users
   const now=new Date();
 
   const completedRecurring=DB.tasks.filter(t=>t.status==='Completed' && t.isRecurring && t.recurrenceType && t.completionDate);
@@ -2720,6 +2727,7 @@ let morningReportSent=localStorage.getItem('ffMorningReport_'+today())==='1';
 let dueWarningsSent=localStorage.getItem('ffDueWarnings_'+today())==='1';
 
 function checkAutoMorningReport(){
+  if(!canWrite()) return; // sending/logging the report is a write; skip for view-only users
   const now=new Date();
   const hour=now.getHours();
   const min=now.getMinutes();
@@ -2949,7 +2957,7 @@ function ensureRoutineCompletions(){
     if(!exists){
       const comp={id:'rc_'+Date.now()+'_'+Math.random().toString(36).substr(2,5), taskId:rt.id, dueDate, completedAt:null, completedBy:null, status:'pending', deadlineDate:rt.deadlineDate||'', deadlineTime:rt.deadlineTime||'17:00', autoArchiveAt:null};
       DB.routineCompletions.push(comp);
-      sb.from('ff_recurring_completions').insert({id:comp.id, task_id:comp.taskId, due_date:comp.dueDate, completed_at:null, completed_by:null, status:'pending', deadline_date:comp.deadlineDate, deadline_time:comp.deadlineTime, auto_archive_at:null}).then(()=>{});
+      if(canWrite()) runDb(sb.from('ff_recurring_completions').insert({id:comp.id, task_id:comp.taskId, due_date:comp.dueDate, completed_at:null, completed_by:null, status:'pending', deadline_date:comp.deadlineDate, deadline_time:comp.deadlineTime, auto_archive_at:null}), 'create routine occurrence', {silent:true});
     }
   }
   markOverdueRoutines();
@@ -3057,7 +3065,7 @@ function checkRoutineReappear(){
       if(!alreadyExists){
         const comp={id:'rc_'+Date.now()+'_'+Math.random().toString(36).substr(2,5), taskId:rt.id, dueDate:newDue, completedAt:null, completedBy:null, status:'pending', deadlineDate:newDeadline||rt.deadlineDate||'', deadlineTime:newDeadlineTime, autoArchiveAt:null};
         DB.routineCompletions.push(comp);
-        sb.from('ff_recurring_completions').insert({id:comp.id, task_id:comp.taskId, due_date:comp.dueDate, completed_at:null, completed_by:null, status:'pending', deadline_date:comp.deadlineDate, deadline_time:comp.deadlineTime, auto_archive_at:null}).then(()=>{});
+        if(canWrite()) runDb(sb.from('ff_recurring_completions').insert({id:comp.id, task_id:comp.taskId, due_date:comp.dueDate, completed_at:null, completed_by:null, status:'pending', deadline_date:comp.deadlineDate, deadline_time:comp.deadlineTime, auto_archive_at:null}), 'reappear routine occurrence', {silent:true});
       }
     }
   }
