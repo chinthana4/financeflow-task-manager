@@ -902,12 +902,17 @@ const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 // ═══════════════════════════════════════════════════════
 // DATA STORE
 // ═══════════════════════════════════════════════════════
+// Passwords are NOT stored here — authentication is handled by Supabase Auth.
+// This map only holds display info (name/role/email/avatar) keyed by the app's
+// short username. Email is used to resolve the account for sign-in.
 const USERS = {
-  sumudu: { name:'Sumudu', role:'Finance Manager', email:'sumudu@focusawards.org.uk', password:'manager123', avatar:'SU', color:'#6366f1' },
-  de:     { name:'Dev',    role:'Officer',         email:'devanand@focusawards.org.uk',    password:'d123', avatar:'DV', color:'#22c55e' },
-  mitiksha:{ name:'Mitiksha',role:'Officer',       email:'mitiksha@focusawards.org.uk',password:'mitiksha321',avatar:'MI', color:'#f59e0b' },
-  trupal:{ name:'Trupal', role:'Office Manager', email:'trupal@focusawards.org.uk', password:'trupal456', avatar:'TR', color:'#8b5cf6' }
+  sumudu: { name:'Sumudu', role:'Finance Manager', email:'sumudu@focusawards.org.uk', avatar:'SU', color:'#6366f1' },
+  de:     { name:'Dev',    role:'Officer',         email:'devanand@focusawards.org.uk', avatar:'DV', color:'#22c55e' },
+  mitiksha:{ name:'Mitiksha',role:'Officer',       email:'mitiksha@focusawards.org.uk', avatar:'MI', color:'#f59e0b' },
+  trupal:{ name:'Trupal', role:'Office Manager', email:'trupal@focusawards.org.uk', avatar:'TR', color:'#8b5cf6' }
 };
+// Reverse lookup: auth email -> short username, so a restored session resolves to currentUser.
+const EMAIL_TO_USERNAME = Object.fromEntries(Object.entries(USERS).map(([u, d]) => [d.email.toLowerCase(), u]));
 
 const MOTIVATIONS = [
   "You're doing amazing today!","Every task completed is progress!",
@@ -1094,16 +1099,24 @@ function isOverdue(task){
 // ═══════════════════════════════════════════════════════
 // AUTH
 // ═══════════════════════════════════════════════════════
-function login(){
+async function login(){
   const uid = document.getElementById('login-user').value;
   const pass = document.getElementById('login-pass').value;
-  if(USERS[uid].password !== pass){ showToast('Invalid password','error'); return; }
+  const email = USERS[uid]?.email;
+  if(!email){ showToast('Unknown account','error'); return; }
+  if(!pass){ showToast('Enter your password','error'); return; }
+  const btn = document.querySelector('#auth-screen .btn-lg');
+  if(btn){ btn.disabled = true; btn.textContent = 'Signing in…'; }
+  const { data, error } = await sb.auth.signInWithPassword({ email, password: pass });
+  if(btn){ btn.disabled = false; btn.textContent = 'Sign In'; }
+  if(error || !data?.session){ showToast('Invalid email or password','error'); return; }
   currentUser = uid;
-  localStorage.setItem('ffUser', uid);
+  localStorage.setItem('ffUser', uid); // convenience only: pre-selects the dropdown next time
   initApp();
 }
 
-function logout(){
+async function logout(){
+  await sb.auth.signOut();
   currentUser=null;
   localStorage.removeItem('ffUser');
   document.getElementById('app').classList.add('hidden');
@@ -3891,7 +3904,7 @@ async function savePersonalTask(){
   if(!date){showToast('Deadline date is required','error');return;}
   if(!time){showToast('Deadline time is required','error');return;}
   const task={title,description:desc,owner:currentUser,deadline_date:date,deadline_time:time,recurrence,status:'Pending',link,created_date:new Date().toISOString().split('T')[0],attachments:[]};
-  const{data,error}=await supabase.from('ff_personal_tasks').insert([task]).select();
+  const{data,error}=await sb.from('ff_personal_tasks').insert([task]).select();
   if(error){showToast('Error saving task','error');console.error(error);return;}
   const r=data[0];
   DB.personalTasks.push({id:r.id,title:r.title,description:r.description||'',owner:r.owner,deadlineDate:r.deadline_date,deadlineTime:r.deadline_time||'17:00',recurrence:r.recurrence||'none',status:r.status||'Pending',completionDate:r.completion_date,createdDate:r.created_date,link:r.link||'',attachments:r.attachments||[]});
@@ -3904,7 +3917,7 @@ async function markCompletePersonalTask(id){
   if(!t) return;
   t.status='Completed';
   t.completionDate=new Date().toISOString().split('T')[0];
-  await supabase.from('ff_personal_tasks').update({status:'Completed',completion_date:t.completionDate}).eq('id',id);
+  await sb.from('ff_personal_tasks').update({status:'Completed',completion_date:t.completionDate}).eq('id',id);
   showToast('Task completed!','success');
   if(t.recurrence!=='none') spawnNextPersonalTask(t);
   renderPersonalTasks();
@@ -3916,7 +3929,7 @@ async function spawnNextPersonalTask(t){
   else if(t.recurrence==='monthly') d.setMonth(d.getMonth()+1);
   else if(t.recurrence==='quarterly') d.setMonth(d.getMonth()+3);
   const next={title:t.title,description:t.description||'',owner:t.owner,deadline_date:d.toISOString().split('T')[0],deadline_time:t.deadlineTime,recurrence:t.recurrence,status:'Pending',link:t.link||'',created_date:new Date().toISOString().split('T')[0],attachments:[]};
-  const{data,error}=await supabase.from('ff_personal_tasks').insert([next]).select();
+  const{data,error}=await sb.from('ff_personal_tasks').insert([next]).select();
   if(!error&&data&&data[0]){
     const r=data[0];
     DB.personalTasks.push({id:r.id,title:r.title,description:r.description||'',owner:r.owner,deadlineDate:r.deadline_date,deadlineTime:r.deadline_time||'17:00',recurrence:r.recurrence||'none',status:'Pending',completionDate:null,createdDate:r.created_date,link:r.link||'',attachments:r.attachments||[]});
@@ -3966,12 +3979,26 @@ document.documentElement.setAttribute('data-theme',savedTheme);
 
 document.getElementById('motivation-auth').textContent=`”${getMotivation()}”`;
 
+// Pre-select the last-used account in the dropdown (UI convenience only).
 const savedUser=localStorage.getItem('ffUser');
 if(savedUser && USERS[savedUser]){
-  currentUser=savedUser;
   document.getElementById('login-user').value=savedUser;
-  initApp();
 }
+
+// Restore a session only if Supabase confirms a valid, non-expired one exists.
+(async ()=>{
+  try{
+    const { data:{ session } } = await sb.auth.getSession();
+    if(session && session.user){
+      const uname = EMAIL_TO_USERNAME[(session.user.email||'').toLowerCase()];
+      if(uname && USERS[uname]){
+        currentUser = uname;
+        document.getElementById('login-user').value = uname;
+        initApp();
+      }
+    }
+  }catch(e){ console.error('session restore failed', e); }
+})();
 </script>
 </body>
 </html>
