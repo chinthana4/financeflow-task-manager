@@ -996,7 +996,12 @@ async function loadDB(){
       completionDate:r.completion_date, createdDate:r.created_date,
       link:r.link||'', attachments:r.attachments||[]
     }));
-  } catch(e){ console.error('loadDB error',e); }
+    return true;
+  } catch(e){
+    console.error('loadDB error',e);
+    showToast('Could not load your data — check your connection and refresh','error');
+    return false;
+  }
 }
 
 function saveDB(){}
@@ -1008,7 +1013,26 @@ async function snapshotDailySummary(){
     const overdue=DB.tasks.filter(t=>t.assignedTo===uid&&(t.status==='Overdue'||(t.status!=='Completed'&&t.deadlineDate&&t.deadlineDate<d))).length;
     if(!DB.dailySummary[d]) DB.dailySummary[d]={};
     DB.dailySummary[d][uid]={completed_count:completed, overdue_count:overdue};
-    await sb.from('ff_daily_summary').upsert({date:d, employee:uid, completed_count:completed, overdue_count:overdue});
+    await runDb(sb.from('ff_daily_summary').upsert({date:d, employee:uid, completed_count:completed, overdue_count:overdue}), 'save daily summary', {silent:true});
+  }
+}
+
+// Central DB-write wrapper: awaits a Supabase query, surfaces any error to the
+// user (and console) instead of failing silently, and returns a success flag.
+// Usage: const ok = await runDb(sb.from('x').insert(...), 'save task');
+async function runDb(query, action, {silent=false}={}){
+  try{
+    const { error } = await query;
+    if(error){
+      console.error(`DB error [${action}]:`, error);
+      if(!silent) showToast(`Couldn't ${action}: ${error.message||'database error'}`, 'error');
+      return false;
+    }
+    return true;
+  }catch(e){
+    console.error(`DB exception [${action}]:`, e);
+    if(!silent) showToast(`Couldn't ${action} — check your connection`, 'error');
+    return false;
   }
 }
 
@@ -1027,25 +1051,26 @@ function taskToRow(t){
 }
 
 async function dbInsertTask(t){
-  await sb.from('ff_tasks').insert(taskToRow(t));
+  return runDb(sb.from('ff_tasks').insert(taskToRow(t)), 'save task');
 }
 async function dbUpdateTask(t){
-  await sb.from('ff_tasks').update(taskToRow(t)).eq('id',t.id);
+  return runDb(sb.from('ff_tasks').update(taskToRow(t)).eq('id',t.id), 'update task');
 }
 async function dbDeleteTask(id){
-  await sb.from('ff_tasks').delete().eq('id',id);
+  return runDb(sb.from('ff_tasks').delete().eq('id',id), 'delete task');
 }
 async function dbInsertComment(c){
-  await sb.from('ff_comments').insert({id:c.id, task_id:c.taskId, user_id:c.userId, text:c.text, created_date:c.createdDate});
+  return runDb(sb.from('ff_comments').insert({id:c.id, task_id:c.taskId, user_id:c.userId, text:c.text, created_date:c.createdDate}), 'save comment');
 }
 async function dbInsertEmail(e){
-  await sb.from('ff_email_log').insert({id:e.id, type:e.type, subject:e.subject, to_email:e.to, from_email:e.from, body:e.body, task_id:e.taskId||null, timestamp:e.timestamp});
+  // Email logging is a background side-effect — record failures quietly, don't nag the user.
+  return runDb(sb.from('ff_email_log').insert({id:e.id, type:e.type, subject:e.subject, to_email:e.to, from_email:e.from, body:e.body, task_id:e.taskId||null, timestamp:e.timestamp}), 'log email', {silent:true});
 }
 async function dbUpsertStepProgress(taskId, stepId, done){
-  await sb.from('ff_step_progress').upsert({task_id:taskId, step_id:stepId, done});
+  return runDb(sb.from('ff_step_progress').upsert({task_id:taskId, step_id:stepId, done}), 'save step progress');
 }
 async function dbInsertRecycleBin(t){
-  await sb.from('ff_recycle_bin').insert({
+  return runDb(sb.from('ff_recycle_bin').insert({
     id:t.id, title:t.title, description:t.description||'', assigned_to:t.assignedTo,
     assigned_by:t.assignedBy, assigned_date:t.assignedDate, deadline_date:t.deadlineDate,
     completion_date:t.completionDate, priority:t.priority, status:t.status,
@@ -1054,10 +1079,10 @@ async function dbInsertRecycleBin(t){
     steps:t.steps||[], attachments:t.attachments||[],
     created_date:t.createdDate, updated_date:t.updatedDate,
     deleted_by:t.deletedBy, deleted_date:t.deletedDate
-  });
+  }), 'archive task');
 }
 async function dbDeleteRecycleBin(id){
-  await sb.from('ff_recycle_bin').delete().eq('id',id);
+  return runDb(sb.from('ff_recycle_bin').delete().eq('id',id), 'remove from archive');
 }
 
 function today(){ return new Date().toISOString().split('T')[0]; }
@@ -3183,7 +3208,7 @@ function renderArchivedRoutines(el){
 async function deleteArchivedCompletion(compId){
   if(!confirm('Remove this archived entry?')) return;
   DB.routineCompletions=DB.routineCompletions.filter(c=>c.id!==compId);
-  await sb.from('ff_recurring_completions').delete().eq('id',compId);
+  await runDb(sb.from('ff_recurring_completions').delete().eq('id',compId), 'remove archived entry');
   renderRoutineTasks();
   showToast('Archived entry removed','info');
 }
@@ -3216,7 +3241,8 @@ async function toggleRoutineTask(taskId, dueDate, checked){
       renderRoutineTasks();
     }, archiveDelay);
 
-    await sb.from('ff_recurring_completions').upsert({id:comp.id, task_id:comp.taskId, due_date:comp.dueDate, completed_at:comp.completedAt, completed_by:comp.completedBy, status:comp.status, deadline_date:comp.deadlineDate, deadline_time:comp.deadlineTime, auto_archive_at:archiveAt});
+    const ok=await runDb(sb.from('ff_recurring_completions').upsert({id:comp.id, task_id:comp.taskId, due_date:comp.dueDate, completed_at:comp.completedAt, completed_by:comp.completedBy, status:comp.status, deadline_date:comp.deadlineDate, deadline_time:comp.deadlineTime, auto_archive_at:archiveAt}), 'mark routine complete');
+    if(!ok){ comp.status='pending'; comp.completedAt=null; comp.completedBy=null; comp.autoArchiveAt=null; renderRoutineTasks(); return; }
 
     spawnNextRoutineOccurrence(rt);
   } else {
@@ -3225,7 +3251,7 @@ async function toggleRoutineTask(taskId, dueDate, checked){
     comp.completedBy=null;
     comp.autoArchiveAt=null;
     comp._archived=false;
-    await sb.from('ff_recurring_completions').upsert({id:comp.id, task_id:comp.taskId, due_date:comp.dueDate, completed_at:null, completed_by:null, status:'pending', deadline_date:comp.deadlineDate, deadline_time:comp.deadlineTime, auto_archive_at:null});
+    await runDb(sb.from('ff_recurring_completions').upsert({id:comp.id, task_id:comp.taskId, due_date:comp.dueDate, completed_at:null, completed_by:null, status:'pending', deadline_date:comp.deadlineDate, deadline_time:comp.deadlineTime, auto_archive_at:null}), 'unmark routine task');
   }
   renderRoutineTasks();
   showToast(checked?'✅ Task marked complete':'Task unmarked','success');
@@ -3285,7 +3311,7 @@ async function spawnNextRoutineOccurrence(rt){
   if(!alreadyExists && nextDue){
     const comp={id:'rc_'+Date.now()+'_'+Math.random().toString(36).substr(2,5), taskId:rt.id, dueDate:nextDue, completedAt:null, completedBy:null, status:'pending', deadlineDate:nextDeadline, deadlineTime:rt.deadlineTime||'17:00', autoArchiveAt:null, appearAt:appearAt?appearAt.toISOString():null};
     DB.routineCompletions.push(comp);
-    await sb.from('ff_recurring_completions').insert({id:comp.id, task_id:comp.taskId, due_date:comp.dueDate, completed_at:null, completed_by:null, status:'pending', deadline_date:comp.deadlineDate, deadline_time:comp.deadlineTime, auto_archive_at:null});
+    await runDb(sb.from('ff_recurring_completions').insert({id:comp.id, task_id:comp.taskId, due_date:comp.dueDate, completed_at:null, completed_by:null, status:'pending', deadline_date:comp.deadlineDate, deadline_time:comp.deadlineTime, auto_archive_at:null}), 'create routine occurrence', {silent:true});
   }
 }
 
@@ -3388,7 +3414,8 @@ async function saveRoutineTask(){
 
   const rt={id:rtId, title, frequency, assignedTo:assignTo, createdBy:currentUser, createdDate:new Date().toISOString(), reminderTime:reminder, active:true, remarks, link, archived:false, archivedDate:null, attachments, deadlineDate, deadlineTime};
   DB.routineTasks.push(rt);
-  await sb.from('ff_recurring_tasks').insert({id:rt.id, title:rt.title, frequency:rt.frequency, assigned_to:rt.assignedTo, created_by:rt.createdBy, created_date:rt.createdDate, reminder_time:rt.reminderTime, active:true, remarks:rt.remarks, link:rt.link, archived:false, archived_date:null, attachments:rt.attachments, deadline_date:rt.deadlineDate, deadline_time:rt.deadlineTime});
+  const ok=await runDb(sb.from('ff_recurring_tasks').insert({id:rt.id, title:rt.title, frequency:rt.frequency, assigned_to:rt.assignedTo, created_by:rt.createdBy, created_date:rt.createdDate, reminder_time:rt.reminderTime, active:true, remarks:rt.remarks, link:rt.link, archived:false, archived_date:null, attachments:rt.attachments, deadline_date:rt.deadlineDate, deadline_time:rt.deadlineTime}), 'add routine task');
+  if(!ok){ DB.routineTasks=DB.routineTasks.filter(x=>x.id!==rt.id); return; }
   pendingRoutineFiles=[];
   ensureRoutineCompletions();
   closeModal();
@@ -3535,7 +3562,7 @@ async function saveRoutineDetails(id){
         comp.completedAt=newStatus==='completed'?new Date().toISOString():null;
         comp.completedBy=newStatus==='completed'?currentUser:null;
         if(newStatus==='completed') spawnNextRoutineOccurrence(rt);
-        await sb.from('ff_recurring_completions').upsert({id:comp.id, task_id:comp.taskId, due_date:comp.dueDate, completed_at:comp.completedAt, completed_by:comp.completedBy, status:comp.status, deadline_date:comp.deadlineDate, deadline_time:comp.deadlineTime});
+        await runDb(sb.from('ff_recurring_completions').upsert({id:comp.id, task_id:comp.taskId, due_date:comp.dueDate, completed_at:comp.completedAt, completed_by:comp.completedBy, status:comp.status, deadline_date:comp.deadlineDate, deadline_time:comp.deadlineTime}), 'sync routine completion', {silent:true});
       }
     }
   }
@@ -3552,11 +3579,11 @@ async function saveRoutineDetails(id){
     if(comp){
       comp.deadlineDate=newDlDate;
       comp.deadlineTime=newDlTime;
-      await sb.from('ff_recurring_completions').update({deadline_date:newDlDate, deadline_time:newDlTime}).eq('id',comp.id);
+      await runDb(sb.from('ff_recurring_completions').update({deadline_date:newDlDate, deadline_time:newDlTime}).eq('id',comp.id), 'update routine deadline', {silent:true});
     }
   }
 
-  await sb.from('ff_recurring_tasks').update(dbUpdate).eq('id',id);
+  await runDb(sb.from('ff_recurring_tasks').update(dbUpdate).eq('id',id), 'update routine task');
   closeModal();
   renderRoutineTasks();
   showToast('✅ Saved!','success');
@@ -3577,7 +3604,7 @@ async function uploadRoutineAttachment(taskId){
   const att={name:file.name, url:urlData.publicUrl, uploadedBy:currentUser, uploadedAt:new Date().toISOString()};
   if(!rt.attachments) rt.attachments=[];
   rt.attachments.push(att);
-  await sb.from('ff_recurring_tasks').update({attachments:rt.attachments}).eq('id',taskId);
+  await runDb(sb.from('ff_recurring_tasks').update({attachments:rt.attachments}).eq('id',taskId), 'save attachment');
   input.value='';
   showToast('📎 File attached!','success');
   viewRoutineTask(taskId);
@@ -3589,7 +3616,7 @@ async function archiveRoutineTask(id){
   if(!rt) return;
   rt.archived=true;
   rt.archivedDate=new Date().toISOString();
-  await sb.from('ff_recurring_tasks').update({archived:true, archived_date:rt.archivedDate}).eq('id',id);
+  await runDb(sb.from('ff_recurring_tasks').update({archived:true, archived_date:rt.archivedDate}).eq('id',id), 'archive routine task');
   renderRoutineTasks();
   showToast('📦 Task archived','success');
 }
@@ -3599,7 +3626,7 @@ async function restoreRoutineTask(id){
   if(!rt) return;
   rt.archived=false;
   rt.archivedDate=null;
-  await sb.from('ff_recurring_tasks').update({archived:false, archived_date:null}).eq('id',id);
+  await runDb(sb.from('ff_recurring_tasks').update({archived:false, archived_date:null}).eq('id',id), 'restore routine task');
   ensureRoutineCompletions();
   renderRoutineTasks();
   showToast('♻️ Task restored','success');
@@ -3610,8 +3637,8 @@ async function deleteRoutineTask(id){
   if(!confirm('Delete this routine task permanently?')) return;
   DB.routineTasks=DB.routineTasks.filter(t=>t.id!==id);
   DB.routineCompletions=DB.routineCompletions.filter(c=>c.taskId!==id);
-  await sb.from('ff_recurring_tasks').delete().eq('id',id);
-  await sb.from('ff_recurring_completions').delete().eq('task_id',id);
+  await runDb(sb.from('ff_recurring_tasks').delete().eq('id',id), 'delete routine task');
+  await runDb(sb.from('ff_recurring_completions').delete().eq('task_id',id), 'delete routine history', {silent:true});
   renderRoutineTasks();
   showToast('Routine task deleted','info');
 }
@@ -3621,8 +3648,8 @@ async function permanentDeleteRoutineTask(id){
   if(!confirm('Permanently delete this archived task? This cannot be undone.')) return;
   DB.routineTasks=DB.routineTasks.filter(t=>t.id!==id);
   DB.routineCompletions=DB.routineCompletions.filter(c=>c.taskId!==id);
-  await sb.from('ff_recurring_tasks').delete().eq('id',id);
-  await sb.from('ff_recurring_completions').delete().eq('task_id',id);
+  await runDb(sb.from('ff_recurring_tasks').delete().eq('id',id), 'delete routine task');
+  await runDb(sb.from('ff_recurring_completions').delete().eq('task_id',id), 'delete routine history', {silent:true});
   renderRoutineTasks();
   showToast('Task permanently deleted','info');
 }
@@ -3668,7 +3695,7 @@ async function importRoutineTasks(input){
     const reminder=row['Reminder Time']||row.reminder_time||'09:00';
     const rt={id:'rt_'+Date.now()+'_'+count, title, frequency:freq, assignedTo:assignTo, createdBy:'sumudu', createdDate:new Date().toISOString(), reminderTime:reminder, active:true, remarks:row.Remarks||'', link:row.Link||'', archived:false, archivedDate:null};
     DB.routineTasks.push(rt);
-    await sb.from('ff_recurring_tasks').insert({id:rt.id, title:rt.title, frequency:rt.frequency, assigned_to:rt.assignedTo, created_by:rt.createdBy, created_date:rt.createdDate, reminder_time:rt.reminderTime, active:true, remarks:rt.remarks, link:rt.link, archived:false, archived_date:null});
+    await runDb(sb.from('ff_recurring_tasks').insert({id:rt.id, title:rt.title, frequency:rt.frequency, assigned_to:rt.assignedTo, created_by:rt.createdBy, created_date:rt.createdDate, reminder_time:rt.reminderTime, active:true, remarks:rt.remarks, link:rt.link, archived:false, archived_date:null}), 're-create routine task', {silent:true});
     count++;
   }
   input.value='';
@@ -3917,7 +3944,8 @@ async function markCompletePersonalTask(id){
   if(!t) return;
   t.status='Completed';
   t.completionDate=new Date().toISOString().split('T')[0];
-  await sb.from('ff_personal_tasks').update({status:'Completed',completion_date:t.completionDate}).eq('id',id);
+  const ok=await runDb(sb.from('ff_personal_tasks').update({status:'Completed',completion_date:t.completionDate}).eq('id',id), 'complete task');
+  if(!ok){ t.status='Pending'; t.completionDate=null; renderPersonalTasks(); return; }
   showToast('Task completed!','success');
   if(t.recurrence!=='none') spawnNextPersonalTask(t);
   renderPersonalTasks();
