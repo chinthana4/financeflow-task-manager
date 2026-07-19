@@ -1,0 +1,3157 @@
+import { sb, USERS, MOTIVATIONS, getMotivation, EMAIL_TO_USERNAME, VIEW_ONLY_USERS } from './config.js';
+import { today, fmt, countWorkingDays, addWorkingDays, isOverdue, escHtml, sanitizeUrl } from './utils.js';
+import Chart from 'chart.js/auto';
+import * as XLSX from 'xlsx';
+import emailjs from '@emailjs/browser';
+
+
+// ═══════════════════════════════════════════════════════
+// DATA STORE
+// ═══════════════════════════════════════════════════════
+function canWrite(){ return !!currentUser && !VIEW_ONLY_USERS.includes(currentUser); }
+
+let DB = { tasks:[], comments:[], attachments:[], recycleBin:[], stepProgress:{}, emailLog:[], dailySummary:{}, routineTasks:[], routineCompletions:[], personalTasks:[] };
+let currentUser = null;
+let charts = {};
+
+async function loadDB(){
+  try {
+    const [tRes, cRes, eRes, spRes, rbRes, dsRes, rtRes, rcRes, ptRes] = await Promise.all([
+      sb.from('ff_tasks').select('*'),
+      sb.from('ff_comments').select('*'),
+      sb.from('ff_email_log').select('*'),
+      sb.from('ff_step_progress').select('*'),
+      sb.from('ff_recycle_bin').select('*'),
+      sb.from('ff_daily_summary').select('*'),
+      sb.from('ff_recurring_tasks').select('*'),
+      sb.from('ff_recurring_completions').select('*'),
+      sb.from('ff_personal_tasks').select('*')
+    ]);
+    DB.tasks = (tRes.data||[]).map(r=>({
+      id:r.id, title:r.title, description:r.description, assignedTo:r.assigned_to,
+      assignedBy:r.assigned_by, assignedDate:r.assigned_date, deadlineDate:r.deadline_date,
+      completionDate:r.completion_date, priority:r.priority, status:r.status,
+      externalLink:r.external_link, isRecurring:r.is_recurring, recurrenceType:r.recurrence_type,
+      urgentFlag:r.urgent_flag, steps:r.steps||[], attachments:r.attachments||[],
+      createdDate:r.created_date, updatedDate:r.updated_date,
+      checkedBy:r.checked_by||null, checkedDate:r.checked_date||null,
+      isDocRequest:r.is_doc_request||false
+    }));
+    DB.comments = (cRes.data||[]).map(r=>({
+      id:r.id, taskId:r.task_id, userId:r.user_id, text:r.text, createdDate:r.created_date
+    }));
+    DB.emailLog = (eRes.data||[]).map(r=>({
+      id:r.id, type:r.type, subject:r.subject, to:r.to_email, from:r.from_email,
+      body:r.body, taskId:r.task_id, timestamp:r.timestamp
+    }));
+    DB.stepProgress = {};
+    (spRes.data||[]).forEach(r=>{
+      if(!DB.stepProgress[r.task_id]) DB.stepProgress[r.task_id]={};
+      DB.stepProgress[r.task_id][r.step_id]=r.done;
+    });
+    DB.recycleBin = (rbRes.data||[]).map(r=>({
+      id:r.id, title:r.title, description:r.description, assignedTo:r.assigned_to,
+      assignedBy:r.assigned_by, assignedDate:r.assigned_date, deadlineDate:r.deadline_date,
+      completionDate:r.completion_date, priority:r.priority, status:r.status,
+      externalLink:r.external_link, isRecurring:r.is_recurring, recurrenceType:r.recurrence_type,
+      urgentFlag:r.urgent_flag, steps:r.steps||[], attachments:r.attachments||[],
+      createdDate:r.created_date, updatedDate:r.updated_date,
+      deletedBy:r.deleted_by, deletedDate:r.deleted_date
+    }));
+    DB.dailySummary={};
+    (dsRes.data||[]).forEach(r=>{
+      if(!DB.dailySummary[r.date]) DB.dailySummary[r.date]={};
+      DB.dailySummary[r.date][r.employee]={completed_count:r.completed_count, overdue_count:r.overdue_count};
+    });
+    DB.routineTasks=(rtRes.data||[]).map(r=>({
+      id:r.id, title:r.title, frequency:r.frequency, assignedTo:r.assigned_to,
+      createdBy:r.created_by, createdDate:r.created_date, reminderTime:r.reminder_time||'09:00', active:r.active!==false,
+      remarks:r.remarks||'', link:r.link||'', archived:r.archived||false, archivedDate:r.archived_date||null, attachments:r.attachments||[]
+    }));
+    DB.routineCompletions=(rcRes.data||[]).map(r=>({
+      id:r.id, taskId:r.task_id, dueDate:r.due_date, completedAt:r.completed_at,
+      completedBy:r.completed_by, status:r.status||'pending',
+      deadlineDate:r.deadline_date||'', deadlineTime:r.deadline_time||'',
+      autoArchiveAt:r.auto_archive_at||null
+    }));
+    DB.personalTasks=(ptRes.data||[]).map(r=>({
+      id:r.id, title:r.title, description:r.description||'', owner:r.owner,
+      deadlineDate:r.deadline_date, deadlineTime:r.deadline_time||'17:00',
+      recurrence:r.recurrence||'none', status:r.status||'Pending',
+      completionDate:r.completion_date, createdDate:r.created_date,
+      link:r.link||'', attachments:r.attachments||[]
+    }));
+    return true;
+  } catch(e){
+    console.error('loadDB error',e);
+    showToast('Could not load your data — check your connection and refresh','error');
+    return false;
+  }
+}
+
+function saveDB(){}
+
+async function snapshotDailySummary(){
+  if(!canWrite()) return; // view-only users don't write daily stats
+  const d=today();
+  for(const uid of ['de','mitiksha']){
+    const completed=DB.tasks.filter(t=>t.assignedTo===uid&&t.completionDate&&t.completionDate.startsWith(d)).length;
+    const overdue=DB.tasks.filter(t=>t.assignedTo===uid&&(t.status==='Overdue'||(t.status!=='Completed'&&t.deadlineDate&&t.deadlineDate<d))).length;
+    if(!DB.dailySummary[d]) DB.dailySummary[d]={};
+    DB.dailySummary[d][uid]={completed_count:completed, overdue_count:overdue};
+    await runDb(sb.from('ff_daily_summary').upsert({date:d, employee:uid, completed_count:completed, overdue_count:overdue}), 'save daily summary', {silent:true});
+  }
+}
+
+// Central DB-write wrapper: awaits a Supabase query, surfaces any error to the
+// user (and console) instead of failing silently, and returns a success flag.
+// Usage: const ok = await runDb(sb.from('x').insert(...), 'save task');
+async function runDb(query, action, {silent=false}={}){
+  try{
+    const { error } = await query;
+    if(error){
+      console.error(`DB error [${action}]:`, error);
+      if(!silent) showToast(`Couldn't ${action}: ${error.message||'database error'}`, 'error');
+      return false;
+    }
+    return true;
+  }catch(e){
+    console.error(`DB exception [${action}]:`, e);
+    if(!silent) showToast(`Couldn't ${action} — check your connection`, 'error');
+    return false;
+  }
+}
+
+function taskToRow(t){
+  return {
+    id:t.id, title:t.title, description:t.description||'', assigned_to:t.assignedTo,
+    assigned_by:t.assignedBy, assigned_date:t.assignedDate, deadline_date:t.deadlineDate,
+    completion_date:t.completionDate, priority:t.priority, status:t.status,
+    external_link:t.externalLink||'', is_recurring:t.isRecurring||false,
+    recurrence_type:t.recurrenceType||'', urgent_flag:t.urgentFlag||false,
+    steps:t.steps||[], attachments:t.attachments||[],
+    created_date:t.createdDate, updated_date:t.updatedDate,
+    checked_by:t.checkedBy||null, checked_date:t.checkedDate||null,
+    is_doc_request:t.isDocRequest||false
+  };
+}
+
+async function dbInsertTask(t){
+  return runDb(sb.from('ff_tasks').insert(taskToRow(t)), 'save task');
+}
+async function dbUpdateTask(t){
+  return runDb(sb.from('ff_tasks').update(taskToRow(t)).eq('id',t.id), 'update task');
+}
+async function dbDeleteTask(id){
+  return runDb(sb.from('ff_tasks').delete().eq('id',id), 'delete task');
+}
+async function dbInsertComment(c){
+  return runDb(sb.from('ff_comments').insert({id:c.id, task_id:c.taskId, user_id:c.userId, text:c.text, created_date:c.createdDate}), 'save comment');
+}
+async function dbInsertEmail(e){
+  // Email logging is a background side-effect — record failures quietly, don't nag the user.
+  return runDb(sb.from('ff_email_log').insert({id:e.id, type:e.type, subject:e.subject, to_email:e.to, from_email:e.from, body:e.body, task_id:e.taskId||null, timestamp:e.timestamp}), 'log email', {silent:true});
+}
+async function dbUpsertStepProgress(taskId, stepId, done){
+  return runDb(sb.from('ff_step_progress').upsert({task_id:taskId, step_id:stepId, done}), 'save step progress');
+}
+async function dbInsertRecycleBin(t){
+  return runDb(sb.from('ff_recycle_bin').insert({
+    id:t.id, title:t.title, description:t.description||'', assigned_to:t.assignedTo,
+    assigned_by:t.assignedBy, assigned_date:t.assignedDate, deadline_date:t.deadlineDate,
+    completion_date:t.completionDate, priority:t.priority, status:t.status,
+    external_link:t.externalLink||'', is_recurring:t.isRecurring||false,
+    recurrence_type:t.recurrenceType||'', urgent_flag:t.urgentFlag||false,
+    steps:t.steps||[], attachments:t.attachments||[],
+    created_date:t.createdDate, updated_date:t.updatedDate,
+    deleted_by:t.deletedBy, deleted_date:t.deletedDate
+  }), 'archive task');
+}
+async function dbDeleteRecycleBin(id){
+  return runDb(sb.from('ff_recycle_bin').delete().eq('id',id), 'remove from archive');
+}
+
+
+// ═══════════════════════════════════════════════════════
+// AUTH
+// ═══════════════════════════════════════════════════════
+async function login(){
+  const uid = document.getElementById('login-user').value;
+  const pass = document.getElementById('login-pass').value;
+  const email = USERS[uid]?.email;
+  if(!email){ showToast('Unknown account','error'); return; }
+  if(!pass){ showToast('Enter your password','error'); return; }
+  const btn = document.querySelector('#auth-screen .btn-lg');
+  if(btn){ btn.disabled = true; btn.textContent = 'Signing in…'; }
+  const { data, error } = await sb.auth.signInWithPassword({ email, password: pass });
+  if(btn){ btn.disabled = false; btn.textContent = 'Sign In'; }
+  if(error || !data?.session){ showToast('Invalid email or password','error'); return; }
+  currentUser = uid;
+  localStorage.setItem('ffUser', uid); // convenience only: pre-selects the dropdown next time
+  initApp();
+}
+
+async function logout(){
+  await sb.auth.signOut();
+  currentUser=null;
+  localStorage.removeItem('ffUser');
+  document.getElementById('app').classList.add('hidden');
+  document.getElementById('auth-screen').classList.remove('hidden');
+}
+
+async function initApp(){
+  document.getElementById('auth-screen').classList.add('hidden');
+  document.getElementById('app').classList.remove('hidden');
+  const u = USERS[currentUser];
+  document.getElementById('sb-avatar').textContent = u.avatar;
+  document.getElementById('sb-avatar').style.background = `linear-gradient(135deg,${u.color},${u.color}cc)`;
+  document.getElementById('sb-name').textContent = u.name;
+  document.getElementById('sb-role').textContent = u.role;
+  buildNav();
+  document.getElementById('new-task-btn').style.display = (currentUser==='sumudu'||currentUser==='de')?'':'none';
+  document.getElementById('doc-request-btn').style.display = (currentUser==='de'||currentUser==='mitiksha')?'':'none';
+  const hasLocal=localStorage.getItem('ffdb');
+  document.getElementById('migrate-btn').style.display = hasLocal?'':'none';
+  await loadDB();
+  await snapshotDailySummary();
+  await checkMainTaskRecurrence();
+  ensureRoutineCompletions();
+  startRoutineReminders();
+  setInterval(checkAutoMorningReport, 60000);
+  checkAutoMorningReport();
+  initCalendar();
+  updateNotifBadge();
+  navigateTo('dashboard');
+  showToast(`Welcome back, ${u.name}! ${getMotivation()}`,'success');
+}
+
+// ═══════════════════════════════════════════════════════
+// NAVIGATION
+// ═══════════════════════════════════════════════════════
+const NAV = [
+  {id:'dashboard',icon:'\u{1F4CA}',label:'Dashboard',all:true},
+  {id:'tasks',icon:'\u{1F4CB}',label:'All Tasks',roles:['sumudu','de','mitiksha','trupal']},
+  {id:'my-tasks',icon:'✅',label:'My Tasks',roles:['sumudu','de','mitiksha']},
+  {id:'my-requests',icon:'📩',label:'My Requests',roles:['de','mitiksha']},
+  {id:'personal-tasks',icon:'📝',label:'Personal Tasks',roles:['sumudu','de','mitiksha']},
+  {id:'schedule',icon:'\u{1F4C5}',label:'Schedule',all:true},
+  {id:'performance',icon:'\u{1F3C6}',label:'Performance',all:true},
+  {id:'reports',icon:'\u{1F4C8}',label:'Reports',all:true},
+  {id:'routine-tasks',icon:'🔄',label:'Routine Tasks',all:true},
+  {id:'recycle',icon:'📦',label:'Archived Tasks',roles:['sumudu']},
+  {id:'emails',icon:'📧',label:'Email Log',roles:['sumudu','de','mitiksha']},
+];
+
+function navLabel(item){
+  if(item.id==='my-tasks' && currentUser==='sumudu') return 'Requests';
+  if(item.id==='routine-tasks' && currentUser==='sumudu') return 'Team Routines';
+  return item.label;
+}
+
+function getPendingRequestsCount(){
+  if(currentUser!=='sumudu') return 0;
+  return DB.tasks.filter(t=>t.isDocRequest && t.assignedTo==='sumudu' && t.status!=='Completed').length;
+}
+
+function buildNav(){
+  const nav = document.getElementById('sidebar-nav');
+  nav.innerHTML = '';
+  NAV.forEach(item=>{
+    if(!item.all && !(item.roles && item.roles.includes(currentUser))) return;
+    const el = document.createElement('div');
+    el.className = 'nav-item';
+    el.dataset.page = item.id;
+    el.setAttribute('role','menuitem');
+    el.setAttribute('tabindex','0');
+    el.innerHTML = `<span class="icon">${item.icon}</span><span class="nav-label">${navLabel(item)}</span>${item.id==='my-tasks'?'<span class="nav-badge hidden" id="nav-badge-requests"></span>':''}`;
+    el.onclick = ()=>{ navigateTo(item.id); closeSidebar(); };
+    el.onkeydown = (e)=>{ if(e.key==='Enter'||e.key===' '){e.preventDefault();navigateTo(item.id);closeSidebar();} };
+    nav.appendChild(el);
+  });
+  updateNavBadges();
+}
+
+function updateNavBadges(){
+  const badge=document.getElementById('nav-badge-requests');
+  if(!badge) return;
+  const count=getPendingRequestsCount();
+  if(count>0){ badge.textContent=count; badge.classList.remove('hidden'); }
+  else { badge.classList.add('hidden'); }
+}
+
+function navigateTo(pageId){
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
+  const pg = document.getElementById('page-'+pageId);
+  if(pg) pg.classList.add('active');
+  const nav = document.querySelector(`.nav-item[data-page="${pageId}"]`);
+  if(nav) nav.classList.add('active');
+  const labels = {dashboard:'Dashboard',tasks:'All Tasks','my-tasks':(currentUser==='sumudu'?'Requests':'My Tasks'),'my-requests':'My Requests','personal-tasks':'Personal Tasks','routine-tasks':(currentUser==='sumudu'?'Team Routines':'Routine Tasks'),performance:'Performance',schedule:'Monthly Schedule',reports:'Reports & Analytics',recycle:'Archived Tasks',emails:'Email Log'};
+  document.getElementById('topbar-title').textContent = labels[pageId]||pageId;
+  if(pageId==='dashboard') renderDashboard();
+  if(pageId==='tasks'){
+    renderTasks();
+    const hideTrupal=currentUser==='trupal';
+    document.getElementById('export-btn-tasks').style.display=hideTrupal?'none':'';
+    document.getElementById('import-btn-tasks').style.display=hideTrupal?'none':'';
+  }
+  if(pageId==='my-tasks') renderMyTasks();
+  if(pageId==='performance'){ initPerfFilters(); renderPerformance(); }
+  if(pageId==='schedule'){ initScheduleFilter(); renderSchedule(); }
+  if(pageId==='recycle') renderRecycle();
+  if(pageId==='reports') renderReports();
+  if(pageId==='emails') renderEmailLog();
+  if(pageId==='my-requests') renderMyRequests();
+  if(pageId==='personal-tasks') loadPersonalTasks();
+  if(pageId==='routine-tasks') initRoutinePage();
+}
+
+// ═══════════════════════════════════════════════════════
+// DASHBOARD
+// ═══════════════════════════════════════════════════════
+function renderDashboard(){
+  const tasks = ((currentUser==='sumudu'||currentUser==='trupal') ? DB.tasks.filter(t=>t.assignedTo==='de'||t.assignedTo==='mitiksha') : DB.tasks.filter(t=>t.assignedTo===currentUser)).filter(t=>!t.isDocRequest);
+  const pending = tasks.filter(t=>t.status==='Pending').length;
+  const inprog  = tasks.filter(t=>t.status==='In Progress').length;
+  const done    = tasks.filter(t=>t.status==='Completed').length;
+  const overdue = tasks.filter(t=>t.status==='Overdue').length;
+
+  // Motivation banner
+  const motivHtml=`<div class="dash-motivation"><span class="motiv-icon">✨</span><span>${getMotivation()} ✨</span></div>`;
+
+  const statData = [
+    {label:'Total Tasks',value:tasks.length,color:'#4a3aaf',bg:'#5b4dc7',icon:'<svg width="22" height="22" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M8 7h8M8 12h5M8 17h8"/></svg>'},
+    {label:'Pending',value:pending,color:'#c88d0a',bg:'#e5a819',icon:'<svg width="22" height="22" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>'},
+    {label:'Completed',value:done,color:'#16864a',bg:'#21a85e',icon:'<svg width="22" height="22" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8 12l3 3 5-5"/></svg>'},
+    {label:'Overdue',value:overdue,color:'#c42828',bg:'#e53e3e',icon:'<svg width="22" height="22" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" viewBox="0 0 24 24"><path d="M12 2L2 20h20L12 2z"/><path d="M12 10v4M12 17h.01"/></svg>'},
+  ];
+
+  const statFilters = ['','Pending','Completed','Overdue'];
+  const personalTasksCard = currentUser==='sumudu' ? `
+    <div class="stat-card clickable" onclick="navigateTo('personal-tasks')">
+      <div style="display:flex;align-items:center;gap:14px">
+        <div class="stat-icon" style="background:#7c3aed;border-radius:var(--radius);color:#fff"><svg width="22" height="22" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" viewBox="0 0 24 24"><path d="M4 4h11l5 5v11H4z"/><path d="M15 4v5h5"/><path d="M8 13h8M8 17h5"/></svg></div>
+        <div class="stat-info"><div class="value" style="color:#7c3aed;font-size:18px">Personal Tasks</div><div class="label">Open →</div></div>
+      </div>
+    </div>` : '';
+  document.getElementById('dash-stats').innerHTML = motivHtml + `<div class="stats-grid">${statData.map((s,i)=>`
+    <div class="stat-card clickable" onclick="dashStatClick('${statFilters[i]}')">
+      <div style="display:flex;align-items:center;gap:14px">
+        <div class="stat-icon" style="background:${s.bg};border-radius:var(--radius);color:#fff">${s.icon}</div>
+        <div class="stat-info"><div class="value" style="color:${s.color}">${s.value}</div><div class="label">${s.label}</div></div>
+      </div>
+    </div>`).join('')}${personalTasksCard}</div>`;
+
+  const isDark = document.documentElement.getAttribute('data-theme')==='dark';
+  const textColor = isDark ? '#9499b3' : '#5c5f77';
+  const gridColor = isDark ? '#2a2b3d' : '#e4e7ef';
+
+  destroyChart('chart-status');
+  charts['chart-status'] = new Chart(document.getElementById('chart-status'),{
+    type:'doughnut',
+    data:{ labels:['Pending','In Progress','Completed','Overdue'],
+           datasets:[{data:[pending,inprog,done,overdue],backgroundColor:['#f59e0b','#3b82f6','#22c55e','#ef4444'],borderWidth:0,borderRadius:4}]},
+    options:{ responsive:true, maintainAspectRatio:false, cutout:'72%', plugins:{ legend:{ position:'bottom', labels:{ color:textColor, padding:14, font:{size:12,weight:'500',family:'Inter'}, usePointStyle:true, pointStyleWidth:8 } } } }
+  });
+
+  destroyChart('chart-monthly');
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const now = new Date();
+  const monthlyDone = months.map((_,m)=> tasks.filter(t=> t.status==='Completed' && t.completionDate && new Date(t.completionDate).getMonth()===m && new Date(t.completionDate).getFullYear()===now.getFullYear()).length);
+  const monthlyTotal = months.map((_,m)=> tasks.filter(t=> t.assignedDate && new Date(t.assignedDate).getMonth()===m && new Date(t.assignedDate).getFullYear()===now.getFullYear()).length);
+  charts['chart-monthly'] = new Chart(document.getElementById('chart-monthly'),{
+    type:'bar',
+    data:{ labels:months, datasets:[
+      {label:'Assigned',data:monthlyTotal,backgroundColor:isDark?'#6366f1':'#6366f1cc',borderRadius:6,borderSkipped:false},
+      {label:'Completed',data:monthlyDone,backgroundColor:isDark?'#22c55e':'#22c55ecc',borderRadius:6,borderSkipped:false}
+    ]},
+    options:{ responsive:true, maintainAspectRatio:false, plugins:{ legend:{ labels:{ color:textColor, font:{size:12,weight:'500',family:'Inter'}, usePointStyle:true, pointStyleWidth:8 } } }, scales:{ x:{ticks:{color:textColor,font:{size:11,family:'Inter'}},grid:{display:false}}, y:{ticks:{color:textColor,font:{size:11,family:'Inter'}},grid:{color:gridColor},border:{dash:[4,4]}} } }
+  });
+
+  // My Performance / Completion Rate widget
+  const myPerfEl=document.getElementById('dash-my-perf');
+  if(myPerfEl){
+    const myTasks = currentUser==='sumudu' ? DB.tasks : DB.tasks.filter(t=>t.assignedTo===currentUser);
+    const myDone = myTasks.filter(t=>t.status==='Completed').length;
+    const myPct = myTasks.length ? Math.round((myDone/myTasks.length)*100) : 0;
+    const ringColor = myPct>=70?'#22c55e':myPct>=40?'#f59e0b':'#ef4444';
+    const circ2=2*Math.PI*48;
+    const dash2=(myPct/100)*circ2;
+    myPerfEl.innerHTML=`<div class="my-perf-card">
+      <h3>Task Completion Rate</h3>
+      <div class="my-perf-ring">
+        <svg width="120" height="120" viewBox="0 0 120 120">
+          <circle cx="60" cy="60" r="48" fill="none" stroke="${isDark?'#2a2b3d':'#e4e7ef'}" stroke-width="10"/>
+          <circle cx="60" cy="60" r="48" fill="none" stroke="${ringColor}" stroke-width="10" stroke-dasharray="${dash2} ${circ2}" stroke-linecap="round" style="transition:stroke-dasharray .8s var(--ease)"/>
+        </svg>
+        <div class="perf-pct" style="color:${ringColor}">${myPct}%</div>
+      </div>
+      <div class="my-perf-label">${myDone} of ${myTasks.length} tasks completed</div>
+    </div>`;
+  }
+
+  if(currentUser==='sumudu'){
+    const employees = ['de','mitiksha'];
+    let html = '<div class="card" style="margin-top:8px"><div class="card-header"><span class="card-title">Employee Overview</span></div><div class="card-body"><div class="perf-grid">';
+    employees.forEach(uid=>{
+      const u=USERS[uid];
+      const etasks=DB.tasks.filter(t=>t.assignedTo===uid);
+      const score=calcScore(uid, new Date().getMonth(), new Date().getFullYear());
+      const color = score>=80?'#22c55e':score>=60?'#f59e0b':'#ef4444';
+      const circ = 2*Math.PI*36;
+      const dash = (score/100)*circ;
+      html+=`<div class="perf-card">
+        <div class="emp-name">${u.name}</div>
+        <div class="emp-role">${u.role}</div>
+        <div class="score-ring" style="width:100px;height:100px">
+          <svg width="100" height="100" viewBox="0 0 100 100">
+            <circle cx="50" cy="50" r="36" fill="none" stroke="${isDark?'#2a2b3d':'#e4e7ef'}" stroke-width="8"/>
+            <circle cx="50" cy="50" r="36" fill="none" stroke="${color}" stroke-width="8" stroke-dasharray="${dash} ${circ}" stroke-linecap="round" style="transition:stroke-dasharray .8s var(--ease)"/>
+          </svg>
+          <div class="score-num" style="color:${color}">${score}</div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:6px;margin-top:8px;width:100%;text-align:left">
+          <div class="score-bar-row"><span class="bar-label">Total</span><span style="font-weight:700;margin-left:auto">${etasks.length}</span></div>
+          <div class="score-bar-row"><span class="bar-label">Completed</span><span style="font-weight:700;color:#22c55e;margin-left:auto">${etasks.filter(t=>t.status==='Completed').length}</span></div>
+          <div class="score-bar-row"><span class="bar-label">Overdue</span><span style="font-weight:700;color:#ef4444;margin-left:auto">${etasks.filter(t=>t.status==='Overdue').length}</span></div>
+        </div>
+      </div>`;
+    });
+    html+='</div></div></div>';
+    document.getElementById('dash-emp-perf').innerHTML = html;
+  } else {
+    document.getElementById('dash-emp-perf').innerHTML='';
+  }
+}
+
+function destroyChart(id){ if(charts[id]){ charts[id].destroy(); delete charts[id]; } }
+
+// ═══════════════════════════════════════════════════════
+// TASK CRUD
+// ═══════════════════════════════════════════════════════
+function openNewTask(){
+  const body = `
+  <div class="form-grid">
+    <div class="form-field full"><label>Task Title</label><input id="nt-title" placeholder="What needs to be done?"></div>
+    <div class="form-field full"><label>Description</label><textarea id="nt-desc" placeholder="Add details..."></textarea></div>
+    <div class="form-field"><label>Assign To</label>
+      ${currentUser==='sumudu'?'<div id="nt-assign-group"><label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-bottom:6px"><input type="checkbox" value="de" class="nt-assign-cb"> Dev</label><label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" value="mitiksha" class="nt-assign-cb"> Mitiksha</label></div>':'<select id="nt-assign"><option value="">— Select —</option><option value="mitiksha">Mitiksha</option></select>'}
+    </div>
+    <div class="form-field"><label>Urgent?</label>
+      <label class="urgent-check">
+        <input type="checkbox" id="nt-urgent-flag" onchange="this.parentElement.classList.toggle('checked',this.checked)">
+        🔴 Mark as Urgent
+      </label>
+    </div>
+    <div class="form-field"><label>Assigned Date</label><input type="date" id="nt-adate" value="${today()}"></div>
+    <div class="form-field"><label>Deadline Date</label><input type="date" id="nt-ddate" value="${today()}"></div>
+    <div class="form-field full"><label>External Link</label><input id="nt-link" placeholder="https://drive.google.com/..."></div>
+    <div class="form-field full"><label>Recurring</label>
+      <select id="nt-recur"><option value="">No Repeat</option><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option><option value="quarterly">Every Three Months</option><option value="annually">Annually</option></select>
+    </div>
+    <div class="form-field full">
+      <label>Attach Files</label>
+      <div class="file-upload-area" id="nt-file-area">
+        <input type="file" multiple id="nt-files" onchange="previewFiles(this,'nt-files-list')">
+        <div class="upload-icon">\u{1F4CE}</div>
+        <p>Click or drag files here</p>
+      </div>
+      <div class="attached-files" id="nt-files-list"></div>
+    </div>
+    <div class="form-field full">
+      <label>Checklist Steps</label>
+      <div class="steps-list" id="nt-steps"></div>
+      <div class="add-step-row">
+        <input id="nt-step-input" placeholder="Add a step..." onkeydown="if(event.key==='Enter'){addStep('nt-steps','nt-step-input')}">
+        <button class="btn btn-secondary btn-sm" onclick="addStep('nt-steps','nt-step-input')">Add</button>
+      </div>
+    </div>
+  </div>`;
+  openModal('New Task', body, [
+    {label:'Cancel', action:'closeModal()', cls:'btn-secondary'},
+    {label:'Create Task', action:'createTask()', cls:'btn-primary'}
+  ]);
+}
+
+function addStep(listId, inputId){
+  const inp = document.getElementById(inputId);
+  const val = inp.value.trim();
+  if(!val) return;
+  const list = document.getElementById(listId);
+  const item = document.createElement('div');
+  item.className='step-item';
+  item.innerHTML=`<input type="checkbox"><span class="step-text">${escHtml(val)}</span><button class="step-del" onclick="this.parentElement.remove()">\u{1F5D1}</button>`;
+  list.appendChild(item);
+  inp.value='';
+  inp.focus();
+}
+
+function getSteps(listId){
+  const steps=[];
+  document.querySelectorAll(`#${listId} .step-item`).forEach(el=>{
+    steps.push({ id:'step_'+Date.now()+Math.random(), text:el.querySelector('.step-text').textContent, done:el.querySelector('input').checked });
+  });
+  return steps;
+}
+
+async function createTask(){
+  const title = document.getElementById('nt-title').value.trim();
+  if(!title){ showToast('Task title is required','error'); return; }
+  let assignees=[];
+  if(currentUser==='sumudu'){
+    document.querySelectorAll('.nt-assign-cb:checked').forEach(cb=>assignees.push(cb.value));
+    if(!assignees.length){ showToast('Please select at least one assignee','error'); return; }
+  } else {
+    if(!document.getElementById('nt-assign').value){ showToast('Please select an assignee','error'); return; }
+    assignees=[document.getElementById('nt-assign').value];
+  }
+  for(const assignee of assignees){
+  const task = {
+    id: 'task_'+Date.now()+'_'+assignee,
+    title,
+    description: document.getElementById('nt-desc').value.trim(),
+    assignedTo: assignee,
+    assignedBy: currentUser,
+    assignedDate: document.getElementById('nt-adate').value || today(),
+    deadlineDate: document.getElementById('nt-ddate').value || today(),
+    completionDate: null,
+    priority: document.getElementById('nt-urgent-flag').checked ? 'Urgent' : 'Normal',
+    status: 'Pending',
+    externalLink: document.getElementById('nt-link').value.trim(),
+    isRecurring: document.getElementById('nt-recur').value!=='',
+    recurrenceType: document.getElementById('nt-recur').value,
+    createdDate: new Date().toISOString(),
+    updatedDate: new Date().toISOString(),
+    steps: getSteps('nt-steps'),
+    attachments: [],
+    urgentFlag: document.getElementById('nt-urgent-flag').checked
+  };
+  if(pendingFiles.length){
+    task.attachments = await uploadFilesToStorage(task.id, pendingFiles);
+  }
+  DB.tasks.push(task);
+  await dbInsertTask(task);
+  simulateEmail('new_task', task);
+  }
+  pendingFiles = [];
+  closeModal();
+  showToast(`Task "${title}" assigned to ${assignees.map(a=>USERS[a].name).join(' & ')}`,'success');
+  renderTasks();
+  renderDashboard();
+  updateNotifBadge();
+}
+
+function openDocRequest(){
+  const body = `
+  <div class="form-grid">
+    <div class="form-field full"><label>Document / Request Title</label><input id="dr-title" placeholder="What document do you need?"></div>
+    <div class="form-field full"><label>Details</label><textarea id="dr-desc" placeholder="Describe what you need..."></textarea></div>
+    <div class="form-field full"><label>Attach Files (optional)</label>
+      <div class="file-upload-area" id="dr-file-area">
+        <input type="file" multiple id="dr-files" onchange="previewFiles(this,'dr-files-list')">
+        <div class="upload-icon">\u{1F4CE}</div>
+        <p>Click or drag files here</p>
+      </div>
+      <div class="attached-files" id="dr-files-list"></div>
+    </div>
+  </div>`;
+  openModal('📩 Request to Manager', body, [
+    {label:'Cancel', action:'closeModal()', cls:'btn-secondary'},
+    {label:'Send Request', action:'createDocRequest()', cls:'btn-primary'}
+  ]);
+}
+
+async function createDocRequest(){
+  const title = document.getElementById('dr-title').value.trim();
+  if(!title){ showToast('Please enter a title','error'); return; }
+  const task = {
+    id: 'req_'+Date.now(),
+    title: '📄 ' + title,
+    description: document.getElementById('dr-desc').value.trim(),
+    assignedTo: 'sumudu',
+    assignedBy: currentUser,
+    assignedDate: today(),
+    deadlineDate: null,
+    completionDate: null,
+    priority: 'Normal',
+    status: 'Pending',
+    externalLink: '',
+    isRecurring: false,
+    recurrenceType: '',
+    urgentFlag: false,
+    isDocRequest: true,
+    createdDate: new Date().toISOString(),
+    updatedDate: new Date().toISOString(),
+    steps: [],
+    attachments: []
+  };
+  if(pendingFiles.length){
+    task.attachments = await uploadFilesToStorage(task.id, pendingFiles);
+  }
+  DB.tasks.push(task);
+  await dbInsertTask(task);
+  pendingFiles = [];
+  closeModal();
+  simulateEmail('doc_request', task);
+  showToast(`Document request sent to Sumudu`,'success');
+  renderTasks();
+  renderDashboard();
+}
+
+let pendingFiles = [];
+function previewFiles(input, listId){
+  const list = document.getElementById(listId);
+  if(!list) return;
+  Array.from(input.files).forEach(f=>{
+    pendingFiles.push(f);
+    const div=document.createElement('div');
+    div.className='attached-file';
+    div.innerHTML=`<span class="file-icon">\u{1F4C4}</span><span class="file-name">${escHtml(f.name)}</span><button class="file-remove" onclick="this.parentElement.remove()">✕</button>`;
+    list.appendChild(div);
+  });
+}
+
+async function uploadFilesToStorage(taskId, files){
+  const uploaded=[];
+  for(const f of files){
+    const path=`${taskId}/${Date.now()}_${f.name}`;
+    const {error}=await sb.storage.from('attachments').upload(path, f);
+    if(!error){
+      const {data}=sb.storage.from('attachments').getPublicUrl(path);
+      uploaded.push({name:f.name, url:data.publicUrl, path, uploadedBy:currentUser});
+    }
+  }
+  return uploaded;
+}
+
+// ═══════════════════════════════════════════════════════
+// RENDER TASKS TABLE
+// ═══════════════════════════════════════════════════════
+function getFilteredTasks(){
+  let tasks = DB.tasks.filter(t=>!t.isDocRequest);
+  if(currentUser==='de'){ tasks=tasks.filter(t=>t.assignedTo==='de'||t.assignedTo==='mitiksha'); }
+  if(currentUser==='trupal'){ tasks=tasks.filter(t=>t.assignedTo==='de'||t.assignedTo==='mitiksha'); }
+  if(currentUser==='mitiksha'){ tasks=tasks.filter(t=>t.assignedTo==='mitiksha'); }
+  const st=document.getElementById('filter-status')?.value;
+  const pr=document.getElementById('filter-priority')?.value;
+  const as=document.getElementById('filter-assignee')?.value;
+  const so=document.getElementById('filter-sort')?.value||'created_desc';
+  if(st==='Pending') tasks=tasks.filter(t=>t.status==='Pending'||t.status==='Overdue');
+  else if(st) tasks=tasks.filter(t=>t.status===st);
+  if(pr) tasks=tasks.filter(t=>t.priority===pr);
+  if(as) tasks=tasks.filter(t=>t.assignedTo===as);
+  const pOrder={Urgent:0};
+  tasks.sort((a,b)=>{
+    const aUrg=a.status!=='Completed'&&a.deadlineDate&&a.deadlineDate<today()?1:0;
+    const bUrg=b.status!=='Completed'&&b.deadlineDate&&b.deadlineDate<today()?1:0;
+    if(aUrg!==bUrg) return bUrg-aUrg;
+    if(so==='created_desc') return new Date(b.createdDate)-new Date(a.createdDate);
+    if(so==='deadline_asc') return (a.deadlineDate||'').localeCompare(b.deadlineDate||'');
+    if(so==='deadline_desc') return (b.deadlineDate||'').localeCompare(a.deadlineDate||'');
+    if(so==='priority') return (pOrder[a.priority]??9)-(pOrder[b.priority]??9);
+    return 0;
+  });
+  return tasks;
+}
+
+function renderTasks(){
+  const tasks=getFilteredTasks();
+  const tbody=document.getElementById('tasks-tbody');
+  if(!tasks.length){ tbody.innerHTML=`<tr><td colspan="5"><div class="empty-state"><div class="empty-icon">\u{1F4ED}</div><p>No tasks found</p></div></td></tr>`; return; }
+  tbody.innerHTML = tasks.map(t=>taskRow(t)).join('');
+}
+
+function renderMyTasks(){
+  let tasks = currentUser==='de'
+    ? DB.tasks.filter(t=>t.assignedTo==='de'||t.assignedTo==='mitiksha')
+    : currentUser==='trupal' ? DB.tasks.filter(t=>t.assignedTo==='de'||t.assignedTo==='mitiksha')
+    : DB.tasks.filter(t=>t.assignedTo===currentUser);
+  const st=document.getElementById('my-filter-status')?.value;
+  const pr=document.getElementById('my-filter-priority')?.value;
+  if(st==='Pending') tasks=tasks.filter(t=>t.status==='Pending'||t.status==='Overdue');
+  else if(st) tasks=tasks.filter(t=>t.status===st);
+  if(pr) tasks=tasks.filter(t=>t.priority===pr);
+  const tbody=document.getElementById('my-tasks-tbody');
+  if(!tasks.length){ tbody.innerHTML=`<tr><td colspan="5"><div class="empty-state"><div class="empty-icon">\u{1F4ED}</div><p>No tasks assigned to you</p></div></td></tr>`; return; }
+  tbody.innerHTML=tasks.map(t=>{
+    const checkedBadge = t.checkedBy ? `<span class="badge badge-checked" style="margin-top:4px;display:inline-block">✔ Checked by ${USERS[t.checkedBy]?.name||t.checkedBy}</span>` : '';
+    return `<tr style="cursor:pointer" onclick="viewTask('${t.id}')">
+      <td><div class="task-title-cell"><div class="title ${t.status==='Completed'?'completed':''}">${(t.urgentFlag||(t.deadlineDate&&t.deadlineDate<today()&&t.status!=='Completed'))&&!t.isDocRequest?'<span class="urgent-banner">🔴 Urgent</span> ':''}${escHtml(t.title)}${t.isRecurring?' \u{1F504}':''}</div><div class="desc">${escHtml(t.description||'')}</div>${checkedBadge}</div></td>
+      <td>${statusBadge(t.status)}</td>
+      <td style="color:${t.deadlineDate&&t.deadlineDate<today()&&t.status!=='Completed'?'var(--danger)':'inherit'};font-weight:500">${t.isDocRequest?'—':fmt(t.deadlineDate)}</td>
+      <td>${t.externalLink?`<a href="${sanitizeUrl(t.externalLink)}" target="_blank" rel="noopener" class="link-chip">Open</a>`:'—'}</td>
+      <td>
+        <div style="display:flex;gap:6px;flex-wrap:wrap" onclick="event.stopPropagation()">
+          <button class="btn btn-secondary btn-sm" onclick="viewTask('${t.id}')">View</button>
+          ${t.status!=='Completed'&&currentUser!=='trupal'?`<button class="btn btn-success btn-sm" onclick="markComplete('${t.id}')">Done</button>`:''}
+          ${currentUser!=='trupal'?`<button class="btn btn-secondary btn-sm" onclick="openRemarks('${t.id}')">Remark</button>`:''}
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+function renderMyRequests(){
+  const requests = DB.tasks.filter(t=>t.isDocRequest && t.assignedBy===currentUser);
+  const tbody = document.getElementById('my-requests-tbody');
+  if(!requests.length){ tbody.innerHTML=`<tr><td colspan="4"><div class="empty-state"><div class="empty-icon">📩</div><p>No requests sent yet</p></div></td></tr>`; return; }
+  tbody.innerHTML = requests.map(t=>{
+    const comments = DB.comments.filter(c=>c.taskId===t.id);
+    const attachments = (t.attachments||[]).filter(f=>typeof f==='object'&&f.url);
+    const statusColor = t.status==='Completed'?'var(--success)':t.status==='In Progress'?'var(--info)':'var(--warning)';
+    let responseHtml='';
+    if(t.status==='Completed'){
+      responseHtml=`<div style="margin-top:8px;font-size:12.5px">`;
+      if(comments.length){
+        responseHtml+=`<div style="color:var(--text3);font-weight:600;margin-bottom:4px">Manager Remarks:</div>`;
+        responseHtml+=comments.map(c=>`<div style="background:var(--surface2);padding:8px 12px;border-radius:var(--radius);margin-bottom:4px;border:1px solid var(--border-subtle)"><strong style="color:var(--text2)">${USERS[c.userId]?.name||c.userId}:</strong> ${escHtml(c.text)}</div>`).join('');
+      }
+      if(attachments.length){
+        responseHtml+=`<div style="color:var(--text3);font-weight:600;margin-top:6px;margin-bottom:4px">Attachments:</div>`;
+        responseHtml+=attachments.map(f=>`<a href="${sanitizeUrl(f.url)}" target="_blank" rel="noopener" class="attached-file" style="text-decoration:none;display:inline-flex;margin-right:6px"><span class="file-icon">📄</span><span class="file-name">${escHtml(f.name)}</span><span style="color:var(--primary);font-size:11px;font-weight:600">⬇</span></a>`).join('');
+      }
+      responseHtml+=`</div>`;
+    }
+    return `<tr>
+      <td><div class="task-title-cell"><div class="title ${t.status==='Completed'?'completed':''}">${escHtml(t.title)}</div><div class="desc">${escHtml(t.description||'')}</div>${responseHtml}</div></td>
+      <td><span style="color:${statusColor};font-weight:700">${t.status}</span></td>
+      <td style="font-weight:500">${fmt(t.assignedDate)}</td>
+      <td><button class="btn btn-secondary btn-sm" onclick="viewTask('${t.id}')">View</button></td>
+    </tr>`;
+  }).join('');
+}
+
+function taskRow(t){
+  const checkedBadge = t.checkedBy ? `<span class="badge badge-checked">✔ Checked by ${USERS[t.checkedBy]?.name||t.checkedBy}</span>` : '';
+  const canCheck = currentUser==='de' && t.assignedTo==='mitiksha' && !t.checkedBy && t.status==='Completed';
+  const desc = t.description || '';
+  return `<tr style="cursor:pointer" onclick="viewTask('${t.id}')">
+    <td style="min-width:260px"><div class="task-title-cell"><div class="title ${t.status==='Completed'?'completed':''}">${(t.urgentFlag||(t.deadlineDate&&t.deadlineDate<today()&&t.status!=='Completed'))&&!t.isDocRequest?'<span class="urgent-banner">🔴 Urgent</span> ':''}${escHtml(t.title)}${t.isRecurring?' \u{1F504}':''}</div><div class="desc" style="font-size:12px;color:var(--text3);margin-top:3px;line-height:1.4">${escHtml(desc)}</div>${checkedBadge}</div></td>
+    <td style="font-size:11px;white-space:nowrap;padding:6px 4px"><div class="user-chip" style="font-size:11px;gap:4px"><div class="chip-avatar" style="width:18px;height:18px;font-size:9px">${USERS[t.assignedTo]?.avatar||'?'}</div>${USERS[t.assignedTo]?.name||t.assignedTo}</div></td>
+    <td style="font-size:11px;padding:6px 4px">${statusBadge(t.status)}</td>
+    <td style="font-size:11px;color:${t.deadlineDate&&t.deadlineDate<today()&&t.status!=='Completed'?'var(--danger)':'inherit'};font-weight:500;white-space:nowrap;padding:6px 4px">${t.isDocRequest?'—':fmt(t.deadlineDate)}</td>
+    <td>
+      <div style="display:flex;gap:6px;flex-wrap:nowrap;justify-content:flex-end;white-space:nowrap" onclick="event.stopPropagation()">
+        <button class="btn btn-secondary btn-sm" style="font-size:10px;padding:3px 6px" onclick="viewTask('${t.id}')">View</button>
+        ${currentUser==='sumudu'?`<button class="btn btn-warning btn-sm" style="font-size:10px;padding:3px 6px" onclick="editTask('${t.id}')">Edit</button>`:''}
+        ${canCheck?`<button class="btn btn-checked btn-sm" style="font-size:10px;padding:3px 6px" onclick="markChecked('${t.id}')">✔</button>`:''}
+        ${t.status!=='Completed'&&currentUser!=='trupal'?`<button class="btn btn-success btn-sm" style="font-size:10px;padding:3px 6px" onclick="markComplete('${t.id}')">Done</button>`:''}
+        ${currentUser!=='trupal'?`<button class="btn btn-secondary btn-sm" style="font-size:10px;padding:3px 6px" onclick="openRemarks('${t.id}')">Note</button>`:''}
+        ${currentUser==='sumudu'?`<button class="btn btn-danger btn-sm" style="font-size:10px;padding:3px 6px" onclick="archiveTask('${t.id}')">Archive</button>`:''}
+      </div>
+    </td>
+  </tr>`;
+}
+
+function statusBadge(s){
+  const map={Pending:'pending','In Progress':'inprogress',Completed:'completed',Overdue:'overdue'};
+  return `<span class="badge badge-${map[s]||'pending'}">${s}</span>`;
+}
+
+async function markChecked(tid){
+  const t=DB.tasks.find(x=>x.id===tid);
+  if(!t) return;
+  t.checkedBy=currentUser;
+  t.checkedDate=new Date().toISOString();
+  t.updatedDate=new Date().toISOString();
+  await dbUpdateTask(t);
+  ['mitiksha','de','sumudu'].forEach(uid=>{
+    if(uid===currentUser) return;
+    const key='seenTasks_'+uid;
+    const seen=JSON.parse(localStorage.getItem(key)||'[]').filter(id=>id!==tid);
+    localStorage.setItem(key, JSON.stringify(seen));
+  });
+  showToast(`Task verified by ${USERS[currentUser].name}`,'success');
+  renderTasks(); renderMyTasks(); updateNotifBadge();
+}
+
+function getSeenTaskIds(){
+  try{ return JSON.parse(localStorage.getItem('seenTasks_'+currentUser)||'[]'); }catch(e){ return []; }
+}
+function setSeenTaskIds(ids){
+  localStorage.setItem('seenTasks_'+currentUser, JSON.stringify(ids));
+}
+function getUnseenTasks(){
+  const seen=new Set(getSeenTaskIds());
+  let tasks=DB.tasks.filter(t=>{
+    if(seen.has(t.id)) return false;
+    if(t.assignedTo===currentUser) return true;
+    if(currentUser==='sumudu') return true;
+    if(currentUser==='de' && t.assignedTo==='mitiksha') return true;
+    return false;
+  });
+  return tasks;
+}
+function updateNotifBadge(){
+  const unseen=getUnseenTasks();
+  const badge=document.getElementById('notif-badge');
+  if(!badge) return;
+  if(unseen.length>0){
+    badge.textContent=unseen.length;
+    badge.classList.remove('hidden');
+  } else {
+    badge.classList.add('hidden');
+  }
+  updateNavBadges();
+}
+function showNotifications(){
+  const unseen=getUnseenTasks();
+  if(!unseen.length){
+    showToast('No new notifications','info');
+    return;
+  }
+  const list=unseen.map(t=>`<div style="padding:10px 14px;border-bottom:1px solid var(--border-subtle);cursor:pointer" onclick="markNotifSeen('${t.id}')">
+    <div style="font-weight:600;font-size:13.5px">${escHtml(t.title)}</div>
+    <div style="font-size:12px;color:var(--text3);margin-top:2px">Assigned by ${USERS[t.assignedBy]?.name||t.assignedBy} · ${fmt(t.createdDate)}</div>
+  </div>`).join('');
+  const body=`<div style="max-height:400px;overflow-y:auto">${list}</div>
+    <div style="padding:12px;text-align:right"><button class="btn btn-secondary btn-sm" onclick="markAllNotifSeen()">Mark all read</button></div>`;
+  openModal('🔔 New Tasks ('+unseen.length+')', body, [{label:'Close',action:'closeModal()',cls:'btn-secondary'}]);
+}
+function markNotifSeen(tid){
+  const seen=getSeenTaskIds();
+  if(!seen.includes(tid)) seen.push(tid);
+  setSeenTaskIds(seen);
+  updateNotifBadge();
+  closeModal();
+  viewTask(tid);
+}
+function markAllNotifSeen(){
+  const unseen=getUnseenTasks();
+  const seen=getSeenTaskIds();
+  unseen.forEach(t=>{ if(!seen.includes(t.id)) seen.push(t.id); });
+  setSeenTaskIds(seen);
+  updateNotifBadge();
+  closeModal();
+  showToast('All notifications marked as read','success');
+}
+
+async function markComplete(tid){
+  if(currentUser==='trupal'){showToast('View only — you cannot complete tasks','error');return;}
+  const t=DB.tasks.find(x=>x.id===tid);
+  if(!t) return;
+  t.status='Completed';
+  t.completionDate=new Date().toISOString();
+  t.updatedDate=new Date().toISOString();
+  await dbUpdateTask(t);
+  await snapshotDailySummary();
+  if(t.isRecurring && t.recurrenceType){
+    await spawnNextMainTask(t);
+  }
+  showToast('Task completed!','success');
+  renderTasks(); renderMyTasks(); renderDashboard();
+}
+
+async function spawnNextMainTask(t){
+  const now=new Date();
+  let appearAt, newDeadline;
+
+  if(t.recurrenceType==='daily'){
+    // Reappear same day at 8PM for next working day
+    appearAt=new Date(now);
+    appearAt.setHours(20,0,0,0);
+    if(now>=appearAt) appearAt=new Date(now.getTime()+1000);
+    const nextDay=new Date(now);
+    nextDay.setDate(nextDay.getDate()+1);
+    while(nextDay.getDay()===0||nextDay.getDay()===6) nextDay.setDate(nextDay.getDate()+1);
+    newDeadline=nextDay.toISOString().split('T')[0];
+  } else if(t.recurrenceType==='weekly'){
+    // Reappear next Monday 7AM
+    const day=now.getDay();
+    const daysToMon=day===0?1:(8-day);
+    appearAt=new Date(now);
+    appearAt.setDate(now.getDate()+daysToMon);
+    appearAt.setHours(7,0,0,0);
+    // Deadline = next Friday
+    const fri=new Date(appearAt);
+    fri.setDate(fri.getDate()+4);
+    newDeadline=fri.toISOString().split('T')[0];
+  } else if(t.recurrenceType==='monthly'){
+    // Reappear on 28th of current month for next month
+    const y=now.getMonth()===11&&now.getDate()>=28?now.getFullYear()+1:now.getFullYear();
+    const m=now.getDate()>=28?(now.getMonth()===11?0:now.getMonth()+1):now.getMonth();
+    appearAt=new Date(y, now.getMonth(), 28, 0, 0, 0);
+    if(now>=appearAt) appearAt=new Date(now.getTime()+1000);
+    const nextM=m===11?0:m+1;
+    const nextY=m===11?y+1:y;
+    const lastDay=new Date(nextY, nextM+1, 0).getDate();
+    newDeadline=`${nextY}-${String(nextM+1).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
+  } else if(t.recurrenceType==='quarterly'){
+    appearAt=new Date(now.getTime()+1000);
+    const d=new Date(t.deadlineDate+'T00:00:00');
+    d.setMonth(d.getMonth()+3);
+    newDeadline=d.toISOString().split('T')[0];
+  } else if(t.recurrenceType==='annually'){
+    appearAt=new Date(now.getTime()+1000);
+    const d=new Date(t.deadlineDate+'T00:00:00');
+    d.setFullYear(d.getFullYear()+1);
+    newDeadline=d.toISOString().split('T')[0];
+  }
+
+  const delay=Math.max(0, appearAt.getTime()-now.getTime());
+  const taskData={title:t.title, description:t.description||'', assignedTo:t.assignedTo,
+    assignedBy:t.assignedBy, deadlineDate:newDeadline, priority:t.priority,
+    externalLink:t.externalLink||'', recurrenceType:t.recurrenceType,
+    steps:t.steps||[], urgentFlag:t.urgentFlag||false};
+
+  if(delay<=1000){
+    await createRecurringOccurrence(taskData);
+  } else {
+    setTimeout(async()=>{
+      await createRecurringOccurrence(taskData);
+      renderTasks(); renderMyTasks(); renderDashboard();
+    }, delay);
+  }
+}
+
+async function createRecurringOccurrence(d){
+  const exists=DB.tasks.find(x=>x.isRecurring && x.title===d.title && x.assignedTo===d.assignedTo && x.recurrenceType===d.recurrenceType && x.status!=='Completed');
+  if(exists) return;
+  const newTask={
+    id:'task_'+Date.now()+'_'+Math.random().toString(36).substr(2,5),
+    title:d.title, description:d.description, assignedTo:d.assignedTo,
+    assignedBy:d.assignedBy, assignedDate:today(), deadlineDate:d.deadlineDate,
+    completionDate:null, priority:d.priority, status:'Pending',
+    externalLink:d.externalLink, isRecurring:true, recurrenceType:d.recurrenceType,
+    createdDate:new Date().toISOString(), updatedDate:new Date().toISOString(),
+    steps:d.steps, attachments:[], urgentFlag:d.urgentFlag, isDocRequest:false
+  };
+  DB.tasks.push(newTask);
+  await dbInsertTask(newTask);
+}
+
+async function checkMainTaskRecurrence(){
+  if(!canWrite()) return; // recurrence spawning is a write; skip for view-only users
+  const now=new Date();
+
+  const completedRecurring=DB.tasks.filter(t=>t.status==='Completed' && t.isRecurring && t.recurrenceType && t.completionDate);
+
+  for(const t of completedRecurring){
+    const compDate=new Date(t.completionDate);
+    // Check if a pending occurrence already exists
+    const hasNext=DB.tasks.find(x=>x.isRecurring && x.recurrenceType===t.recurrenceType && x.title===t.title && x.assignedTo===t.assignedTo && x.status!=='Completed' && x.id!==t.id);
+    if(hasNext) continue;
+
+    let shouldSpawn=false;
+    if(t.recurrenceType==='daily'){
+      const reappear=new Date(compDate); reappear.setHours(20,0,0,0);
+      if(now>=reappear || now.toISOString().split('T')[0]>compDate.toISOString().split('T')[0]) shouldSpawn=true;
+    } else if(t.recurrenceType==='weekly'){
+      const day=now.getDay();
+      const mon=new Date(now); mon.setDate(now.getDate()-(day===0?6:day-1)); mon.setHours(7,0,0,0);
+      if(now>=mon && compDate<mon) shouldSpawn=true;
+    } else if(t.recurrenceType==='monthly'){
+      const appear28=new Date(now.getFullYear(), now.getMonth(), 28, 0, 0, 0);
+      if(now>=appear28 && compDate<appear28) shouldSpawn=true;
+      if(now.getMonth()!==compDate.getMonth()||now.getFullYear()!==compDate.getFullYear()) shouldSpawn=true;
+    } else if(t.recurrenceType==='quarterly'){
+      const compQ=Math.floor(compDate.getMonth()/3);
+      const nowQ=Math.floor(now.getMonth()/3);
+      if(nowQ!==compQ || now.getFullYear()!==compDate.getFullYear()) shouldSpawn=true;
+    }
+    if(shouldSpawn) await spawnNextMainTask(t);
+  }
+
+}
+
+async function archiveTask(tid){
+  if(!confirm('Archive this task?')) return;
+  const idx=DB.tasks.findIndex(x=>x.id===tid);
+  if(idx===-1) return;
+  const t=DB.tasks.splice(idx,1)[0];
+  const archived={...t, deletedBy:currentUser, deletedDate:new Date().toISOString()};
+  DB.recycleBin.push(archived);
+  await dbDeleteTask(tid);
+  await dbInsertRecycleBin(archived);
+  showToast('Task archived','warning');
+  renderTasks(); renderDashboard();
+}
+
+// ═══════════════════════════════════════════════════════
+// VIEW TASK MODAL
+// ═══════════════════════════════════════════════════════
+function viewTask(tid){
+  const t=DB.tasks.find(x=>x.id===tid);
+  if(!t) return;
+  const comments=DB.comments.filter(c=>c.taskId===tid);
+  const steps=t.steps||[];
+  const stepProgress=DB.stepProgress[tid]||{};
+  const stepsHtml=steps.length?`
+    <div style="margin-top:20px">
+      <strong style="font-size:13px;color:var(--text2);text-transform:uppercase;letter-spacing:.06em;font-size:12px">Checklist</strong>
+      <div class="steps-list" style="margin-top:10px">
+        ${steps.map(s=>`
+          <div class="step-item">
+            <input type="checkbox" ${stepProgress[s.id]?'checked':''} onchange="toggleStep('${tid}','${s.id}',this.checked)">
+            <span class="step-text ${stepProgress[s.id]?'done':''}" id="step-lbl-${s.id}">${escHtml(s.text)}</span>
+          </div>`).join('')}
+      </div>
+    </div>`:'';
+
+  const attachments=t.attachments||[];
+  const isTrupal=currentUser==='trupal';
+  const attachHtml=attachments.length?`<div class="attached-files">${attachments.map((f,i)=>{
+    const canRemove = !isTrupal && (currentUser==='sumudu' || (typeof f==='object' && f.uploadedBy===currentUser));
+    const removeBtn = canRemove ? `<button class="file-remove" onclick="event.preventDefault();event.stopPropagation();removeAttachment('${tid}',${i})" title="Remove">✕</button>` : '';
+    if(typeof f==='object'&&f.url){
+      if(isTrupal){
+        return `<div class="attached-file"><span class="file-icon">\u{1F4C4}</span><span class="file-name">${escHtml(f.name)}</span><span style="color:var(--text3);font-size:11px">🔒 View only</span></div>`;
+      }
+      return `<div class="attached-file"><a href="${sanitizeUrl(f.url)}" target="_blank" rel="noopener" style="display:flex;align-items:center;gap:10px;flex:1;text-decoration:none;color:inherit"><span class="file-icon">\u{1F4C4}</span><span class="file-name">${escHtml(f.name)}</span><span style="color:var(--primary);font-size:12px;font-weight:600">⬇ Open</span></a>${removeBtn}</div>`;
+    }
+    return `<div class="attached-file"><span class="file-icon">\u{1F4C4}</span><span class="file-name">${escHtml(typeof f==='string'?f:f.name)}</span>${removeBtn}</div>`;
+  }).join('')}</div>`:'<p style="color:var(--text3);font-size:13px">No attachments</p>';
+
+  const body=`
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px">
+      ${statusBadge(t.status)}
+      <span class="badge badge-${t.priority.toLowerCase()}">${t.priority}</span>
+      ${t.isRecurring?`<span class="badge" style="background:var(--primary-light);color:var(--primary)">\u{1F504} ${t.recurrenceType}</span>`:''}
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;font-size:13.5px;margin-bottom:20px">
+      <div><div style="color:var(--text3);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Assigned To</div><div style="font-weight:600">${USERS[t.assignedTo]?.name}</div></div>
+      <div><div style="color:var(--text3);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Assigned By</div><div style="font-weight:600">${USERS[t.assignedBy]?.name}</div></div>
+      <div><div style="color:var(--text3);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Assigned Date & Time</div><div style="font-weight:500">${t.createdDate?new Date(t.createdDate).toLocaleString('en-GB',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'}):fmt(t.assignedDate)}</div></div>
+      <div><div style="color:var(--text3);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Deadline</div><div style="font-weight:500;color:${t.deadlineDate<today()&&t.status!=='Completed'?'var(--danger)':'inherit'}">${fmt(t.deadlineDate)}</div></div>
+      ${t.completionDate?`<div><div style="color:var(--text3);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Completed Date & Time</div><div style="font-weight:500">${new Date(t.completionDate).toLocaleString('en-GB',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'})}</div></div>`:''}
+    </div>
+    ${t.description?`<div style="margin-bottom:16px;font-size:14px;color:var(--text2);background:var(--surface2);padding:16px 20px;border-radius:var(--radius);border:1px solid var(--border-subtle);line-height:1.7;white-space:pre-wrap;max-height:300px;overflow-y:auto">${escHtml(t.description)}</div>`:''}
+    <div style="margin-bottom:16px">
+      <div style="color:var(--text3);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">External Link</div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input type="url" id="vt-link-${tid}" value="${escHtml(t.externalLink||'')}" placeholder="https://..." style="flex:1;padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;background:var(--surface);color:var(--text)">
+        <button class="btn btn-primary btn-sm" style="font-size:11px;padding:5px 10px" onclick="saveTaskLink('${tid}')">Save</button>
+        ${t.externalLink?`<a href="${sanitizeUrl(t.externalLink)}" target="_blank" rel="noopener" style="font-size:12px;color:var(--primary);white-space:nowrap">🔗 Open</a>`:''}
+      </div>
+    </div>
+    ${stepsHtml}
+    <div style="margin-top:20px">
+      <div style="color:var(--text3);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px">📌 Original Task Attachments</div>
+      ${attachHtml}
+      ${currentUser!=='trupal'?`<div class="file-upload-area" style="margin-top:10px;padding:14px">
+        <input type="file" multiple id="view-files" onchange="addAttachmentToTask('${tid}',this)">
+        <p style="font-size:12px;color:var(--text3)">+ Attach file</p>
+      </div>`:''}
+    </div>
+    <div class="comments-section">
+      <div style="color:var(--text3);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:14px">Remarks & Comments</div>
+      ${comments.length?comments.map(c=>`
+        <div class="comment-item">
+          <div class="comment-avatar" style="background:linear-gradient(135deg,${USERS[c.userId]?.color||'#6366f1'},${USERS[c.userId]?.color||'#6366f1'}cc)">${USERS[c.userId]?.avatar||'?'}</div>
+          <div class="comment-bubble">
+            <div class="comment-meta"><strong>${USERS[c.userId]?.name||c.userId}</strong> · ${new Date(c.createdDate).toLocaleString()}</div>
+            <div class="comment-text">${escHtml(c.text)}</div>
+            ${(c.attachments&&c.attachments.length)?`<div style="margin-top:8px;border-top:1px solid var(--border-subtle);padding-top:6px"><div style="font-size:11px;color:var(--text3);font-weight:600;margin-bottom:4px">📎 Reply Attachments</div>${c.attachments.map(a=>'<div style="margin-top:3px"><a href="'+sanitizeUrl(a.url)+'" target="_blank" style="font-size:12px;color:var(--primary)">📄 '+escHtml(a.name)+'</a></div>').join('')}</div>`:''}
+          </div>
+        </div>`).join(''):'<p style="color:var(--text3);font-size:13px;margin-bottom:14px">No comments yet.</p>'}
+      ${currentUser!=='trupal'?`<div class="comment-input-row"><input id="comment-input" placeholder="Write a remark..." onkeydown="if(event.key==='Enter')addComment('${tid}')"><div style="display:flex;gap:4px;align-items:center"><label class="btn btn-secondary btn-sm" style="cursor:pointer;padding:5px 8px" title="Attach file to reply">📎<input type="file" multiple id="comment-files" style="display:none"></label><button class="btn btn-primary btn-sm" onclick="addComment('${tid}')">Send</button></div></div><div id="comment-files-preview" style="margin-top:4px;font-size:12px;color:var(--text3)"></div>`:'<p style="color:var(--text3);font-size:12px;font-style:italic">View only — comments disabled</p>'}
+    </div>
+  `;
+  const footer=[{label:'Close',action:'closeModal()',cls:'btn-secondary'}];
+  if(currentUser!=='trupal' && t.status!=='Completed') footer.push({label:'Mark Complete',action:`markComplete('${tid}');closeModal()`,cls:'btn-success'});
+  if(currentUser==='sumudu') footer.push({label:'Archive',action:`archiveTask('${tid}');closeModal()`,cls:'btn-danger'});
+  openModal(escHtml(t.title), body, footer);
+}
+
+async function toggleStep(tid,sid,checked){
+  if(!DB.stepProgress[tid]) DB.stepProgress[tid]={};
+  DB.stepProgress[tid][sid]=checked;
+  await dbUpsertStepProgress(tid,sid,checked);
+  const lbl=document.getElementById('step-lbl-'+sid);
+  if(lbl){ lbl.classList.toggle('done',checked); }
+}
+
+async function saveTaskLink(tid){
+  const t=DB.tasks.find(x=>x.id===tid);
+  if(!t) return;
+  const linkEl=document.getElementById('vt-link-'+tid);
+  if(!linkEl) return;
+  t.externalLink=linkEl.value.trim();
+  await dbUpdateTask(t);
+  showToast('🔗 Link saved!','success');
+  viewTask(tid);
+}
+
+async function addAttachmentToTask(tid,input){
+  const t=DB.tasks.find(x=>x.id===tid);
+  if(!t) return;
+  if(!t.attachments) t.attachments=[];
+  const files=Array.from(input.files);
+  const uploaded=await uploadFilesToStorage(tid, files);
+  t.attachments.push(...uploaded);
+  await dbUpdateTask(t);
+  showToast('File attached','success');
+  viewTask(tid);
+}
+
+async function removeAttachment(tid, index){
+  if(!confirm('Remove this attachment?')) return;
+  const t=DB.tasks.find(x=>x.id===tid);
+  if(!t||!t.attachments) return;
+  const f=t.attachments[index];
+  if(typeof f==='object'&&f.path){
+    await sb.storage.from('attachments').remove([f.path]);
+  }
+  t.attachments.splice(index,1);
+  await dbUpdateTask(t);
+  showToast('Attachment removed','warning');
+  viewTask(tid);
+}
+
+function openRemarks(tid){ viewTask(tid); }
+
+function editTask(tid){
+  const t=DB.tasks.find(x=>x.id===tid);
+  if(!t) return;
+  const body=`
+  <div class="form-grid">
+    <div class="form-field full"><label>Task Title</label><input id="et-title" value="${escHtml(t.title)}"></div>
+    <div class="form-field full"><label>Description</label><textarea id="et-desc">${escHtml(t.description||'')}</textarea></div>
+    <div class="form-field"><label>Assign To</label>
+      <select id="et-assign"><option value="de" ${t.assignedTo==='de'?'selected':''}>Dev</option><option value="mitiksha" ${t.assignedTo==='mitiksha'?'selected':''}>Mitiksha</option></select>
+    </div>
+    <div class="form-field"><label>Status</label>
+      <select id="et-status"><option value="Pending" ${t.status==='Pending'?'selected':''}>Pending</option><option value="In Progress" ${t.status==='In Progress'?'selected':''}>In Progress</option><option value="Completed" ${t.status==='Completed'?'selected':''}>Completed</option><option value="Overdue" ${t.status==='Overdue'?'selected':''}>Overdue</option></select>
+    </div>
+    <div class="form-field"><label>Assigned Date</label><input type="date" id="et-adate" value="${t.assignedDate||''}"></div>
+    <div class="form-field"><label>Deadline Date</label><input type="date" id="et-ddate" value="${t.deadlineDate||''}"></div>
+    <div class="form-field full"><label>External Link</label><input id="et-link" value="${escHtml(t.externalLink||'')}"></div>
+    <div class="form-field"><label>Recurring</label>
+      <select id="et-recur"><option value="" ${!t.isRecurring?'selected':''}>No Repeat</option><option value="daily" ${t.recurrenceType==='daily'?'selected':''}>Daily</option><option value="weekly" ${t.recurrenceType==='weekly'?'selected':''}>Weekly</option><option value="monthly" ${t.recurrenceType==='monthly'?'selected':''}>Monthly</option></select>
+    </div>
+    <div class="form-field"><label>Urgent?</label>
+      <label class="urgent-check ${t.urgentFlag?'checked':''}">
+        <input type="checkbox" id="et-urgent-flag" ${t.urgentFlag?'checked':''} onchange="this.parentElement.classList.toggle('checked',this.checked)">
+        🔴 Mark as Urgent
+      </label>
+    </div>
+    <div class="form-field full"><label>Attachments</label>
+      <div class="attached-files" id="et-attachments">${(t.attachments||[]).map((f,i)=>{
+        const name=typeof f==='object'?f.name:f;
+        const link=typeof f==='object'&&f.url?`<a href="${sanitizeUrl(f.url)}" target="_blank" rel="noopener" style="color:var(--primary);font-size:12px;font-weight:600;text-decoration:none">⬇ Open</a>`:'';
+        return `<div class="attached-file"><span class="file-icon">📄</span><span class="file-name">${escHtml(name)}</span>${link}<button class="file-remove" onclick="removeAttachmentFromEdit('${tid}',${i})">✕</button></div>`;
+      }).join('')}</div>
+      <div class="file-upload-area" style="margin-top:10px;padding:14px">
+        <input type="file" multiple id="et-files" onchange="previewFiles(this,'et-new-files')">
+        <p style="font-size:12px;color:var(--text3)">+ Attach new files</p>
+      </div>
+      <div class="attached-files" id="et-new-files"></div>
+    </div>
+  </div>`;
+  openModal('Edit Task', body, [
+    {label:'Cancel', action:'closeModal()', cls:'btn-secondary'},
+    {label:'Save Changes', action:`saveEditTask('${tid}')`, cls:'btn-primary'}
+  ]);
+}
+
+async function removeAttachmentFromEdit(tid, index){
+  const t=DB.tasks.find(x=>x.id===tid);
+  if(!t||!t.attachments) return;
+  const f=t.attachments[index];
+  if(typeof f==='object'&&f.path){
+    await sb.storage.from('attachments').remove([f.path]);
+  }
+  t.attachments.splice(index,1);
+  await dbUpdateTask(t);
+  showToast('Attachment removed','warning');
+  editTask(tid);
+}
+
+async function saveEditTask(tid){
+  const t=DB.tasks.find(x=>x.id===tid);
+  if(!t) return;
+  const title=document.getElementById('et-title').value.trim();
+  if(!title){ showToast('Task title is required','error'); return; }
+  t.title=title;
+  t.description=document.getElementById('et-desc').value.trim();
+  t.assignedTo=document.getElementById('et-assign').value;
+  t.status=document.getElementById('et-status').value;
+  t.assignedDate=document.getElementById('et-adate').value;
+  t.deadlineDate=document.getElementById('et-ddate').value;
+  t.externalLink=document.getElementById('et-link').value.trim();
+  const recur=document.getElementById('et-recur').value;
+  t.isRecurring=recur!=='';
+  t.recurrenceType=recur;
+  t.urgentFlag=document.getElementById('et-urgent-flag').checked;
+  t.priority=t.urgentFlag?'Urgent':'Normal';
+  // If deadline changed to future and task was overdue, move to Pending
+  if(t.status==='Overdue' && t.deadlineDate && t.deadlineDate >= today()){
+    t.status='Pending';
+  }
+  if(pendingFiles.length){
+    const uploaded=await uploadFilesToStorage(tid, pendingFiles);
+    if(!t.attachments) t.attachments=[];
+    t.attachments.push(...uploaded);
+  }
+  if(t.status==='Completed'&&!t.completionDate) t.completionDate=today();
+  t.updatedDate=new Date().toISOString();
+  await dbUpdateTask(t);
+  closeModal();
+  showToast('Task updated successfully','success');
+  renderTasks(); renderMyTasks(); renderDashboard();
+}
+
+async function addComment(tid){
+  const inp=document.getElementById('comment-input');
+  const text=inp.value.trim();
+  const fileInput=document.getElementById('comment-files');
+  const files=fileInput?Array.from(fileInput.files):[];
+  if(!text && !files.length) return;
+  let replyAttachments=[];
+  if(files.length){
+    for(const file of files){
+      if(file.size>10*1024*1024){showToast(file.name+' too large','error');continue;}
+      const filePath=`comments/${tid}/${Date.now()}_${file.name}`;
+      const {error}=await sb.storage.from('attachments').upload(filePath, file);
+      if(error){showToast('Upload failed','error');continue;}
+      const {data:urlData}=sb.storage.from('attachments').getPublicUrl(filePath);
+      replyAttachments.push({name:file.name, url:urlData.publicUrl, uploadedBy:currentUser, uploadedAt:new Date().toISOString()});
+    }
+  }
+  const c={ id:'c_'+Date.now(), taskId:tid, userId:currentUser, text, createdDate:new Date().toISOString(), attachments:replyAttachments };
+  DB.comments.push(c);
+  await dbInsertComment(c);
+  inp.value='';
+  if(fileInput) fileInput.value='';
+  const t=DB.tasks.find(x=>x.id===tid);
+  if(t && t.status==='Completed' && t.assignedTo!==currentUser){
+    const seen=getSeenTaskIds();
+    const idx=seen.indexOf(tid);
+    if(idx!==-1) seen.splice(idx,1);
+    localStorage.setItem('seenTasks_'+t.assignedTo, JSON.stringify(
+      JSON.parse(localStorage.getItem('seenTasks_'+t.assignedTo)||'[]').filter(id=>id!==tid)
+    ));
+  }
+  viewTask(tid);
+}
+
+// ═══════════════════════════════════════════════════════
+// PERFORMANCE
+// ═══════════════════════════════════════════════════════
+function calcScore(uid, month, year){
+  const tasks=DB.tasks.filter(t=>t.assignedTo===uid && t.assignedDate && new Date(t.assignedDate).getMonth()===month && new Date(t.assignedDate).getFullYear()===year);
+  if(!tasks.length) return 100;
+  let score=100;
+  tasks.forEach(t=>{
+    if(t.status==='Completed'){
+      if(t.completionDate && t.deadlineDate){
+        const workDays=countWorkingDays(t.assignedDate, t.completionDate);
+        const allowedDays=countWorkingDays(t.assignedDate, t.deadlineDate);
+        if(workDays<=allowedDays) score+=2;
+        else score-=5;
+      }
+    } else if(t.status==='Overdue'){ score-=10; }
+    else { score-=2; }
+  });
+  return Math.max(0,Math.min(100,Math.round(score)));
+}
+
+function initPerfFilters(){
+  const now=new Date();
+  document.getElementById('perf-month').value=now.getMonth();
+  const ySel=document.getElementById('perf-year');
+  if(!ySel.options.length){
+    for(let y=now.getFullYear()-2;y<=now.getFullYear();y++){ const o=document.createElement('option'); o.value=y; o.textContent=y; if(y===now.getFullYear())o.selected=true; ySel.appendChild(o); }
+  }
+}
+
+function renderPerformance(){
+  const month=parseInt(document.getElementById('perf-month').value);
+  const year=parseInt(document.getElementById('perf-year').value)||new Date().getFullYear();
+  const months=['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const employees = (currentUser==='sumudu'||currentUser==='trupal')?['de','mitiksha']:[currentUser];
+  const isDark=document.documentElement.getAttribute('data-theme')==='dark';
+  let html='<div class="perf-grid">';
+  employees.forEach(uid=>{
+    const u=USERS[uid];
+    const tasks=DB.tasks.filter(t=>t.assignedTo===uid && t.assignedDate && new Date(t.assignedDate).getMonth()===month && new Date(t.assignedDate).getFullYear()===year);
+    const done=tasks.filter(t=>t.status==='Completed').length;
+    const late=tasks.filter(t=>t.status==='Completed'&&t.completionDate&&t.completionDate>t.deadlineDate).length;
+    const overdue=tasks.filter(t=>t.status==='Overdue').length;
+    const ontime=done-late;
+    const score=calcScore(uid,month,year);
+    const color=score>=80?'#22c55e':score>=60?'#f59e0b':'#ef4444';
+    const circ=2*Math.PI*40;
+    const dash=(score/100)*circ;
+    html+=`<div class="perf-card">
+      <div class="emp-name">${u.name}</div>
+      <div class="emp-role">${months[month]} ${year}</div>
+      <div class="score-ring" style="width:100px;height:100px">
+        <svg width="100" height="100" viewBox="0 0 100 100">
+          <circle cx="50" cy="50" r="40" fill="none" stroke="${isDark?'#2a2b3d':'#e4e7ef'}" stroke-width="8"/>
+          <circle cx="50" cy="50" r="40" fill="none" stroke="${color}" stroke-width="8" stroke-dasharray="${dash} ${circ}" stroke-linecap="round"/>
+        </svg>
+        <div class="score-num" style="color:${color}">${score}</div>
+      </div>
+      <div style="font-size:12.5px;text-align:center;margin-bottom:14px;color:var(--text3);font-weight:600">out of 100</div>
+      ${bar('Assigned',tasks.length,tasks.length||1,'#6366f1')}
+      ${bar('Completed',done,tasks.length||1,'#22c55e')}
+      ${bar('On Time',ontime,tasks.length||1,'#3b82f6')}
+      ${bar('Late',late,tasks.length||1,'#f59e0b')}
+      ${bar('Overdue',overdue,tasks.length||1,'#ef4444')}
+    </div>`;
+  });
+  html+='</div>';
+  document.getElementById('perf-content').innerHTML=html;
+}
+
+function bar(label,val,total,color){
+  const pct=total?Math.round((val/total)*100):0;
+  return `<div class="score-bar-row"><span class="bar-label">${label}</span><div class="score-bar-bg"><div class="score-bar-fill" style="width:${pct}%;background:${color}"></div></div><span style="font-size:12px;width:24px;text-align:right;font-weight:600">${val}</span></div>`;
+}
+
+function exportPerfExcel(){
+  const month=parseInt(document.getElementById('perf-month').value);
+  const year=parseInt(document.getElementById('perf-year').value)||new Date().getFullYear();
+  const months=['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const rows=[['Employee','Month','Year','Total','Completed','Late','Overdue','Score']];
+  ['de','mitiksha'].forEach(uid=>{
+    const tasks=DB.tasks.filter(t=>t.assignedTo===uid && t.assignedDate && new Date(t.assignedDate).getMonth()===month && new Date(t.assignedDate).getFullYear()===year);
+    const done=tasks.filter(t=>t.status==='Completed').length;
+    const late=tasks.filter(t=>t.status==='Completed'&&t.completionDate&&t.completionDate>t.deadlineDate).length;
+    const overdue=tasks.filter(t=>t.status==='Overdue').length;
+    rows.push([USERS[uid].name,months[month],year,tasks.length,done,late,overdue,calcScore(uid,month,year)]);
+  });
+  const ws=XLSX.utils.aoa_to_sheet(rows);
+  const wb=XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb,ws,'Performance');
+  XLSX.writeFile(wb,`Performance_${months[month]}_${year}.xlsx`);
+}
+
+// ═══════════════════════════════════════════════════════
+// SCHEDULE PAGE
+// ═══════════════════════════════════════════════════════
+function initScheduleFilter(){
+  document.getElementById('schedule-month-filter').value=new Date().getMonth();
+}
+
+function renderSchedule(){
+  const month=parseInt(document.getElementById('schedule-month-filter').value);
+  const months=['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const year=new Date().getFullYear();
+  const employees = (currentUser==='sumudu'||currentUser==='trupal')?['de','mitiksha']:[currentUser];
+  let html='';
+  employees.forEach(uid=>{
+    const u=USERS[uid];
+    const tasks=DB.tasks.filter(t=>t.assignedTo===uid && t.deadlineDate && new Date(t.deadlineDate).getMonth()===month && new Date(t.deadlineDate).getFullYear()===year);
+    if(!tasks.length && currentUser!=='sumudu') { html+=`<div class="empty-state"><div class="empty-icon">\u{1F4C5}</div><p>No tasks scheduled for ${months[month]}</p></div>`; return; }
+    html+=`<div class="schedule-month"><h3>\u{1F464} ${u.name} — ${months[month]} ${year}</h3>`;
+    if(!tasks.length){ html+=`<p style="color:var(--text3);font-size:13.5px;font-weight:500">No tasks this month</p>`; }
+    tasks.forEach(t=>{
+      const steps=t.steps||[];
+      const sp=DB.stepProgress[t.id]||{};
+      const done=steps.filter(s=>sp[s.id]).length;
+      html+=`<div class="schedule-task-item">
+        <div class="schedule-task-header">
+          <span class="priority-dot dot-${t.priority.toLowerCase()}"></span>
+          <span class="schedule-task-title ${t.status==='Completed'?'completed':''}">${escHtml(t.title)}</span>
+          ${statusBadge(t.status)}
+          <span style="font-size:12.5px;color:var(--text3);margin-left:auto;font-weight:500">Due: ${fmt(t.deadlineDate)}</span>
+        </div>
+        ${steps.length?`
+          <div class="schedule-steps">
+            <div style="font-size:12px;color:var(--text3);margin-bottom:6px;font-weight:600">${done}/${steps.length} steps completed</div>
+            ${steps.map(s=>`<div class="schedule-step">
+              <input type="checkbox" ${sp[s.id]?'checked':''} onchange="toggleStep('${t.id}','${s.id}',this.checked)">
+              <span class="step-label ${sp[s.id]?'done':''}">${escHtml(s.text)}</span>
+            </div>`).join('')}
+          </div>`:''}
+      </div>`;
+    });
+    html+='</div>';
+  });
+  document.getElementById('schedule-content').innerHTML=html||`<div class="empty-state"><div class="empty-icon">\u{1F4C5}</div><p>No tasks found for this month</p></div>`;
+}
+
+// ═══════════════════════════════════════════════════════
+// PERSONAL TASKS
+// ═══════════════════════════════════════════════════════
+let personalTasksLoaded=false;
+function loadPersonalTasks(){
+  if(currentUser==='sumudu'){
+    document.getElementById('personal-tasks-sumudu').style.display='';
+    document.getElementById('personal-tasks-officer').style.display='none';
+    if(!personalTasksLoaded){
+      const frame=document.getElementById("personal-tasks-frame");
+      if(!frame) return;
+  const html=atob("PCFET0NUWVBFIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CjxtZXRhIGNoYXJzZXQ9IlVURi04IiAvPgo8bWV0YSBuYW1lPSJ2aWV3cG9ydCIgY29udGVudD0id2lkdGg9ZGV2aWNlLXdpZHRoLCBpbml0aWFsLXNjYWxlPTEuMCwgbWF4aW11bS1zY2FsZT0xIiAvPgo8dGl0bGU+RHV0eSBMaXN0IE1hbmFnZXI8L3RpdGxlPgo8bGluayByZWw9Imljb24iIGhyZWY9ImRhdGE6aW1hZ2Uvc3ZnK3htbCw8c3ZnIHhtbG5zPSUyMmh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnJTIyIHZpZXdCb3g9JTIyMCAwIDI0IDI0JTIyPjx0ZXh0IHk9JTIyLjllbSUyMiBmb250LXNpemU9JTIyMjIlMjI+JUUyJTlDJTg1PC90ZXh0Pjwvc3ZnPiI+CjxzY3JpcHQgc3JjPSJodHRwczovL2Nkbi50YWlsd2luZGNzcy5jb20iPjwvc2NyaXB0Pgo8c2NyaXB0IHNyYz0iaHR0cHM6Ly9jZG4uanNkZWxpdnIubmV0L25wbS9Ac3VwYWJhc2Uvc3VwYWJhc2UtanNAMiI+PC9zY3JpcHQ+CjxzY3JpcHQ+CiAgdGFpbHdpbmQuY29uZmlnID0gewogICAgZGFya01vZGU6ICdjbGFzcycsCiAgICB0aGVtZTogewogICAgICBleHRlbmQ6IHsKICAgICAgICBjb2xvcnM6IHsKICAgICAgICAgIHByaW1hcnk6IHsKICAgICAgICAgICAgNTA6ICcjZWVmMmZmJywgMTAwOiAnI2UwZTdmZicsIDIwMDogJyNjN2QyZmUnLCAzMDA6ICcjYTViNGZjJywKICAgICAgICAgICAgNDAwOiAnIzgxOGNmOCcsIDUwMDogJyM2MzY2ZjEnLCA2MDA6ICcjNGY0NmU1JywgNzAwOiAnIzQzMzhjYScsCiAgICAgICAgICAgIDgwMDogJyMzNzMwYTMnLCA5MDA6ICcjMzEyZTgxJwogICAgICAgICAgfQogICAgICAgIH0KICAgICAgfQogICAgfQogIH0KPC9zY3JpcHQ+CjxzY3JpcHQgc3JjPSJodHRwczovL2Nkbi5qc2RlbGl2ci5uZXQvbnBtL3hsc3hAMC4xOC41L2Rpc3QveGxzeC5mdWxsLm1pbi5qcyI+PC9zY3JpcHQ+CjxzY3JpcHQgc3JjPSJodHRwczovL2Nkbi5qc2RlbGl2ci5uZXQvbnBtL21hbW1vdGhAMS44LjAvbWFtbW90aC5icm93c2VyLm1pbi5qcyI+PC9zY3JpcHQ+CjxzY3JpcHQgc3JjPSJodHRwczovL2Nkbi5qc2RlbGl2ci5uZXQvbnBtL2pzcGRmQDIuNS4xL2Rpc3QvanNwZGYudW1kLm1pbi5qcyI+PC9zY3JpcHQ+CjxzdHlsZT4KICBodG1sIHsgLXdlYmtpdC10YXAtaGlnaGxpZ2h0LWNvbG9yOiB0cmFuc3BhcmVudDsgfQogIGJvZHkgewogICAgZm9udC1mYW1pbHk6ICdJbnRlcicsIHN5c3RlbS11aSwgLWFwcGxlLXN5c3RlbSwgc2Fucy1zZXJpZjsKICAgIC13ZWJraXQtZm9udC1zbW9vdGhpbmc6IGFudGlhbGlhc2VkOwogIH0KICA6Oi13ZWJraXQtc2Nyb2xsYmFyIHsgd2lkdGg6IDhweDsgaGVpZ2h0OiA4cHg7IH0KICA6Oi13ZWJraXQtc2Nyb2xsYmFyLXRodW1iIHsgYmFja2dyb3VuZDogI2QxZDVkYjsgYm9yZGVyLXJhZGl1czogOTk5OXB4OyB9CiAgLmRhcmsgOjotd2Via2l0LXNjcm9sbGJhci10aHVtYiB7IGJhY2tncm91bmQ6ICMzNzQxNTE7IH0KICA6Oi13ZWJraXQtc2Nyb2xsYmFyLXRyYWNrIHsgYmFja2dyb3VuZDogdHJhbnNwYXJlbnQ7IH0KCiAgLmxpbmUtY2xhbXAtMiB7CiAgICBkaXNwbGF5OiAtd2Via2l0LWJveDsKICAgIC13ZWJraXQtbGluZS1jbGFtcDogMjsKICAgIC13ZWJraXQtYm94LW9yaWVudDogdmVydGljYWw7CiAgICBvdmVyZmxvdzogaGlkZGVuOwogIH0KCiAgQGtleWZyYW1lcyBmYWRlSW4geyBmcm9tIHsgb3BhY2l0eTogMCB9IHRvIHsgb3BhY2l0eTogMSB9IH0KICBAa2V5ZnJhbWVzIHNsaWRlVXAgeyBmcm9tIHsgb3BhY2l0eTogMDsgdHJhbnNmb3JtOiB0cmFuc2xhdGVZKDhweCkgfSB0byB7IG9wYWNpdHk6IDE7IHRyYW5zZm9ybTogdHJhbnNsYXRlWSgwKSB9IH0KICBAa2V5ZnJhbWVzIHNwaW4geyB0byB7IHRyYW5zZm9ybTogcm90YXRlKDM2MGRlZykgfSB9CiAgLmFuaW0tZmFkZSB7IGFuaW1hdGlvbjogZmFkZUluIC4ycyBlYXNlLW91dDsgfQogIC5hbmltLXNsaWRlIHsgYW5pbWF0aW9uOiBzbGlkZVVwIC4ycyBlYXNlLW91dDsgfQogIC5hbmltLXNwaW4geyBhbmltYXRpb246IHNwaW4gMXMgbGluZWFyIGluZmluaXRlOyBkaXNwbGF5OiBpbmxpbmUtZmxleDsgfQoKICAuaWNvbiB7IHdpZHRoOiAxLjI1cmVtOyBoZWlnaHQ6IDEuMjVyZW07IGZsZXgtc2hyaW5rOiAwOyB9CiAgLmljb24tc20geyB3aWR0aDogMXJlbTsgaGVpZ2h0OiAxcmVtOyBmbGV4LXNocmluazogMDsgfQoKICBrYmQgewogICAgZm9udC1mYW1pbHk6IHVpLW1vbm9zcGFjZSwgbW9ub3NwYWNlOwogICAgZm9udC1zaXplOiAwLjc1cmVtOwogIH0KCiAgaW5wdXRbdHlwZT0iY2hlY2tib3giXS5kbG0tY2hlY2tib3ggewogICAgd2lkdGg6IDEuNXJlbTsgaGVpZ2h0OiAxLjVyZW07IGZsZXgtc2hyaW5rOiAwOyBjdXJzb3I6IHBvaW50ZXI7CiAgICBhY2NlbnQtY29sb3I6ICM0ZjQ2ZTU7CiAgfQoKICB0ZXh0YXJlYSwgaW5wdXRbdHlwZT0idGV4dCJdLCBpbnB1dFt0eXBlPSJlbWFpbCJdLCBpbnB1dFt0eXBlPSJwYXNzd29yZCJdIHsKICAgIGZvbnQtZmFtaWx5OiBpbmhlcml0OwogIH0KPC9zdHlsZT4KPC9oZWFkPgo8Ym9keSBjbGFzcz0iYmctZ3JheS01MCB0ZXh0LWdyYXktOTAwIGRhcms6YmctZ3JheS05NTAgZGFyazp0ZXh0LWdyYXktMTAwIHRyYW5zaXRpb24tY29sb3JzIGR1cmF0aW9uLTIwMCI+CiAgPGRpdiBpZD0iYXBwIj48L2Rpdj4KPHNjcmlwdD4KLyogPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CiAgIFBlcnNvbmFsIER1dHkgTGlzdCBNYW5hZ2VyIC0gc2luZ2xlLWZpbGUgY2xpZW50LXNpZGUgYXBwCiAgIERhdGEgaXMgc3RvcmVkIGVudGlyZWx5IGluIHRoaXMgYnJvd3NlcidzIGxvY2FsU3RvcmFnZS4KICAgPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09ICovCgovLyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KLy8gVXRpbGl0aWVzCi8vIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQpmdW5jdGlvbiB1aWQoKSB7CiAgcmV0dXJuIERhdGUubm93KCkudG9TdHJpbmcoMzYpICsgTWF0aC5yYW5kb20oKS50b1N0cmluZygzNikuc2xpY2UoMiwgOCk7Cn0KCmZ1bmN0aW9uIG5vd0lTTygpIHsKICByZXR1cm4gbmV3IERhdGUoKS50b0lTT1N0cmluZygpOwp9CgpmdW5jdGlvbiBlc2NhcGVIdG1sKHN0cikgewogIGlmIChzdHIgPT09IG51bGwgfHwgc3RyID09PSB1bmRlZmluZWQpIHJldHVybiAnJzsKICByZXR1cm4gU3RyaW5nKHN0cikKICAgIC5yZXBsYWNlKC8mL2csICcmYW1wOycpCiAgICAucmVwbGFjZSgvPC9nLCAnJmx0OycpCiAgICAucmVwbGFjZSgvPi9nLCAnJmd0OycpCiAgICAucmVwbGFjZSgvIi9nLCAnJnF1b3Q7JykKICAgIC5yZXBsYWNlKC8nL2csICcmIzM5OycpOwp9CgpmdW5jdGlvbiBmb3JtYXREYXRlKGlzbykgewogIGlmICghaXNvKSByZXR1cm4gJyc7CiAgY29uc3QgZCA9IG5ldyBEYXRlKGlzbyk7CiAgaWYgKGlzTmFOKGQuZ2V0VGltZSgpKSkgcmV0dXJuICcnOwogIHJldHVybiBkLnRvTG9jYWxlRGF0ZVN0cmluZyh1bmRlZmluZWQsIHsgbW9udGg6ICdzaG9ydCcsIGRheTogJ251bWVyaWMnLCB5ZWFyOiAnbnVtZXJpYycgfSk7Cn0KCmZ1bmN0aW9uIGZvcm1hdERhdGVUaW1lKGlzbykgewogIGlmICghaXNvKSByZXR1cm4gJ+KAlCc7CiAgY29uc3QgZCA9IG5ldyBEYXRlKGlzbyk7CiAgaWYgKGlzTmFOKGQuZ2V0VGltZSgpKSkgcmV0dXJuICfigJQnOwogIHJldHVybiBkLnRvTG9jYWxlU3RyaW5nKHVuZGVmaW5lZCwgeyBtb250aDogJ3Nob3J0JywgZGF5OiAnbnVtZXJpYycsIHllYXI6ICdudW1lcmljJywgaG91cjogJzItZGlnaXQnLCBtaW51dGU6ICcyLWRpZ2l0JyB9KTsKfQoKZnVuY3Rpb24gZGVib3VuY2UoZm4sIGRlbGF5KSB7CiAgbGV0IHRpbWVyID0gbnVsbDsKICByZXR1cm4gZnVuY3Rpb24gKC4uLmFyZ3MpIHsKICAgIGNsZWFyVGltZW91dCh0aW1lcik7CiAgICB0aW1lciA9IHNldFRpbWVvdXQoKCkgPT4gZm4uYXBwbHkodGhpcywgYXJncyksIGRlbGF5KTsKICB9Owp9CgpmdW5jdGlvbiBpc1RydXRoeVZhbHVlKHZhbHVlKSB7CiAgaWYgKHZhbHVlID09PSB1bmRlZmluZWQgfHwgdmFsdWUgPT09IG51bGwpIHJldHVybiBmYWxzZTsKICBjb25zdCBzdHIgPSBTdHJpbmcodmFsdWUpLnRyaW0oKS50b0xvd2VyQ2FzZSgpOwogIHJldHVybiBbJ3llcycsICd5JywgJ3RydWUnLCAnMScsICd1cmdlbnQnXS5pbmNsdWRlcyhzdHIpOwp9CgovLyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KLy8gSW5saW5lIGljb24gc2V0IChzaW1wbGUgb3JpZ2luYWwgZ2VvbWV0cmljIFNWR3MpCi8vIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQpjb25zdCBJQ09OUyA9IHsKICBjaGVjazogJzxzdmcgY2xhc3M9Imljb24iIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJjdXJyZW50Q29sb3IiIHN0cm9rZS13aWR0aD0iMi41IiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxwYXRoIGQ9Ik01IDEzbDQgNEwxOSA3Ii8+PC9zdmc+JywKICBjbG9jazogJzxzdmcgY2xhc3M9Imljb24iIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJjdXJyZW50Q29sb3IiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIj48Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSI5Ii8+PHBhdGggZD0iTTEyIDd2NWwzIDMiLz48L3N2Zz4nLAogIGxvYWRlcjogJzxzdmcgY2xhc3M9Imljb24gYW5pbS1zcGluIiB2aWV3Qm94PSIwIDAgMjQgMjQiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCI+PHBhdGggZD0iTTEyIDNhOSA5IDAgMSAwIDkgOSIgLz48L3N2Zz4nLAogIGFsZXJ0OiAnPHN2ZyBjbGFzcz0iaWNvbiIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxwYXRoIGQ9Ik0xMiAyLjUgMjEuNSAyMEgyLjV6Ii8+PHBhdGggZD0iTTEyIDl2NCIvPjxjaXJjbGUgY3g9IjEyIiBjeT0iMTYuMyIgcj0iMC42IiBmaWxsPSJjdXJyZW50Q29sb3IiIHN0cm9rZT0ibm9uZSIvPjwvc3ZnPicsCiAgcGVuY2lsOiAnPHN2ZyBjbGFzcz0iaWNvbiIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxwYXRoIGQ9Ik00IDIwaDRMMTkuNSA4LjVhMi4xIDIuMSAwIDAgMC0zLTNMNCAxN3oiLz48cGF0aCBkPSJNMTQgNi41bDMgMyIvPjwvc3ZnPicsCiAgdHJhc2g6ICc8c3ZnIGNsYXNzPSJpY29uIiB2aWV3Qm94PSIwIDAgMjQgMjQiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PHBhdGggZD0iTTQgN2gxNiIvPjxwYXRoIGQ9Ik05IDdWNC41aDZWNyIvPjxwYXRoIGQ9Ik02IDdsMSAxM2gxMGwxLTEzIi8+PHBhdGggZD0iTTEwIDExdjZNMTQgMTF2NiIvPjwvc3ZnPicsCiAgc2VhcmNoOiAnPHN2ZyBjbGFzcz0iaWNvbiIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxjaXJjbGUgY3g9IjExIiBjeT0iMTEiIHI9IjciLz48cGF0aCBkPSJNMjEgMjFsLTQuNS00LjUiLz48L3N2Zz4nLAogIHg6ICc8c3ZnIGNsYXNzPSJpY29uIiB2aWV3Qm94PSIwIDAgMjQgMjQiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjIuNSIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIj48cGF0aCBkPSJNNSA1bDE0IDE0TTE5IDVMNSAxOSIvPjwvc3ZnPicsCiAgcGx1czogJzxzdmcgY2xhc3M9Imljb24iIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJjdXJyZW50Q29sb3IiIHN0cm9rZS13aWR0aD0iMi41IiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxwYXRoIGQ9Ik0xMiA1djE0TTUgMTJoMTQiLz48L3N2Zz4nLAogIHN1bjogJzxzdmcgY2xhc3M9Imljb24iIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJjdXJyZW50Q29sb3IiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIj48Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSI0Ii8+PHBhdGggZD0iTTEyIDJ2Mk0xMiAyMHYyTTQgMTJIMk0yMiAxMmgtMk00LjkgNC45bDEuNCAxLjRNMTcuNyAxNy43bDEuNCAxLjRNMTkuMSA0LjlsLTEuNCAxLjRNNi4zIDE3LjdsLTEuNCAxLjQiLz48L3N2Zz4nLAogIG1vb246ICc8c3ZnIGNsYXNzPSJpY29uIiB2aWV3Qm94PSIwIDAgMjQgMjQiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PHBhdGggZD0iTTIxIDEyLjhBOSA5IDAgMSAxIDExLjIgMyA3IDcgMCAwIDAgMjEgMTIuOHoiLz48L3N2Zz4nLAogIHVwbG9hZDogJzxzdmcgY2xhc3M9Imljb24iIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJjdXJyZW50Q29sb3IiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIj48cGF0aCBkPSJNMTIgMTVWNE03IDlsNS01IDUgNSIvPjxwYXRoIGQ9Ik00IDE4LjVoMTYiLz48L3N2Zz4nLAogIGRvd25sb2FkOiAnPHN2ZyBjbGFzcz0iaWNvbiIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxwYXRoIGQ9Ik0xMiA0djExTTcgMTBsNSA1IDUtNSIvPjxwYXRoIGQ9Ik00IDE4LjVoMTYiLz48L3N2Zz4nLAogIHNlbmQ6ICc8c3ZnIGNsYXNzPSJpY29uIiB2aWV3Qm94PSIwIDAgMjQgMjQiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PHBhdGggZD0iTTIxIDMgMTEgMTMiLz48cGF0aCBkPSJNMjEgM2wtNi41IDE4LTQtOC04LTR6Ii8+PC9zdmc+JywKICBsb2dvdXQ6ICc8c3ZnIGNsYXNzPSJpY29uIiB2aWV3Qm94PSIwIDAgMjQgMjQiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PHBhdGggZD0iTTkgMjFINmEyIDIgMCAwIDEtMi0yVjVhMiAyIDAgMCAxIDItMmgzIi8+PHBhdGggZD0iTTE2IDE3bDUtNS01LTUiLz48cGF0aCBkPSJNMjEgMTJIOSIvPjwvc3ZnPicsCiAgbGlzdDogJzxzdmcgY2xhc3M9Imljb24iIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJjdXJyZW50Q29sb3IiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIj48cGF0aCBkPSJNOSA2aDExTTkgMTJoMTFNOSAxOGgxMSIvPjxjaXJjbGUgY3g9IjQuNSIgY3k9IjYiIHI9IjEiLz48Y2lyY2xlIGN4PSI0LjUiIGN5PSIxMiIgcj0iMSIvPjxjaXJjbGUgY3g9IjQuNSIgY3k9IjE4IiByPSIxIi8+PC9zdmc+JywKICBtZXNzYWdlOiAnPHN2ZyBjbGFzcz0iaWNvbiIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxwYXRoIGQ9Ik00IDRoMTZ2MTJIOWwtNSA0eiIvPjwvc3ZnPicsCiAgZXhjZWw6ICc8c3ZnIGNsYXNzPSJpY29uIiB2aWV3Qm94PSIwIDAgMjQgMjQiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PHBhdGggZD0iTTQgNGgxMWw1IDV2MTFINHoiLz48cGF0aCBkPSJNMTUgNHY1aDUiLz48cGF0aCBkPSJNOCAxMmw0IDZNMTIgMTJsLTQgNiIvPjwvc3ZnPicsCiAgcGRmOiAnPHN2ZyBjbGFzcz0iaWNvbiIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxwYXRoIGQ9Ik00IDRoMTFsNSA1djExSDR6Ii8+PHBhdGggZD0iTTE1IDR2NWg1Ii8+PHBhdGggZD0iTTggMTd2LTRoMS41YTEuNSAxLjUgMCAwIDEgMCAzSDhNMTMgMTd2LTRoMS41TTEzIDE1aDEuNU0xNyAxM3Y0bDEuMi0yIi8+PC9zdmc+JywKICBleWU6ICc8c3ZnIGNsYXNzPSJpY29uIiB2aWV3Qm94PSIwIDAgMjQgMjQiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PHBhdGggZD0iTTIgMTJzMy41LTcgMTAtNyAxMCA3IDEwIDctMy41IDctMTAgNy0xMC03LTEwLTd6Ii8+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMyIvPjwvc3ZnPicsCiAgZXllT2ZmOiAnPHN2ZyBjbGFzcz0iaWNvbiIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxwYXRoIGQ9Ik0yIDEyczMuNS03IDEwLTdjMiAwIDMuNi41IDUgMS4zTTIyIDEycy0xIDItMyAzLjhNOS45IDkuOWEzIDMgMCAwIDAgNC4yIDQuMiIvPjxwYXRoIGQ9Ik0zIDNsMTggMTgiLz48L3N2Zz4nLAogIG1haWw6ICc8c3ZnIGNsYXNzPSJpY29uIiB2aWV3Qm94PSIwIDAgMjQgMjQiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PHJlY3QgeD0iMyIgeT0iNSIgd2lkdGg9IjE4IiBoZWlnaHQ9IjE0IiByeD0iMiIvPjxwYXRoIGQ9Ik0zIDdsOSA2IDktNiIvPjwvc3ZnPicsCiAgbG9jazogJzxzdmcgY2xhc3M9Imljb24iIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJjdXJyZW50Q29sb3IiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIj48cmVjdCB4PSI0IiB5PSIxMSIgd2lkdGg9IjE2IiBoZWlnaHQ9IjkiIHJ4PSIyIi8+PHBhdGggZD0iTTggMTFWN2E0IDQgMCAwIDEgOCAwdjQiLz48L3N2Zz4nLAogIHdpZmlPZmY6ICc8c3ZnIGNsYXNzPSJpY29uLXNtIiB2aWV3Qm94PSIwIDAgMjQgMjQiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PHBhdGggZD0iTTIgMmwyMCAyMCIvPjxwYXRoIGQ9Ik04LjUgMTYuNWE1IDUgMCAwIDEgNyAwIi8+PHBhdGggZD0iTTUgMTIuNWExMCAxMCAwIDAgMSA0LTIuM00xOSAxMi41YTEwIDEwIDAgMCAwLTIuNS0xLjlNMTIgMjBoLjAxIi8+PC9zdmc+JywKICBiYWNrdXA6ICc8c3ZnIGNsYXNzPSJpY29uIiB2aWV3Qm94PSIwIDAgMjQgMjQiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PHBhdGggZD0iTTIxIDEyYTkgOSAwIDEgMS0yLjYtNi40Ii8+PHBhdGggZD0iTTIxIDR2NWgtNSIvPjwvc3ZnPicsCn07CgovLyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KLy8gU3VwYWJhc2UgY29ubmVjdGlvbgovLyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KY29uc3QgZGxtU2IgPSB3aW5kb3cuc3VwYWJhc2UuY3JlYXRlQ2xpZW50KAogICdodHRwczovL29oa2t4YXhnaXppdXZkb3Zwbm11LnN1cGFiYXNlLmNvJywKICAnZXlKaGJHY2lPaUpJVXpJMU5pSXNJblI1Y0NJNklrcFhWQ0o5LmV5SnBjM01pT2lKemRYQmhZbUZ6WlNJc0luSmxaaUk2SW05b2EydDRZWGhuYVhwcGRYWmtiM1p3Ym0xMUlpd2ljbTlzWlNJNkltRnViMjRpTENKcFlYUWlPakUzT0RFeE9UUTJOemdzSW1WNGNDSTZNakE1TmpjM01EWTNPSDAuZUxfSHJIcFQyZ2U4U3NzWnpkMVgtU1Qtd3N3ek5TZGJWUFNkNmVTZGxKSScKKTsKCi8vIFN0b3JhZ2UgaGVscGVycyAoU3VwYWJhc2UtYmFja2VkKQpmdW5jdGlvbiB0YXNrVG9Sb3codCl7CiAgcmV0dXJuIHtpZDp0LmlkLCB0YXNrX25hbWU6dC50YXNrTmFtZSwgZGVzY3JpcHRpb246dC5kZXNjcmlwdGlvbnx8JycsIHN0YXR1czp0LnN0YXR1c3x8J3BlbmRpbmcnLAogICAgaXNfdXJnZW50OiEhdC5pc1VyZ2VudCwgbm90ZXM6dC5ub3Rlc3x8JycsIGNvbW1lbnRzOnQuY29tbWVudHN8fFtdLCBkdWVfZGF0ZTp0LmR1ZURhdGV8fCcnLCBjYXRlZ29yeTp0LmNhdGVnb3J5fHwnJywKICAgIGNyZWF0ZWRfYXQ6dC5jcmVhdGVkQXQsIHVwZGF0ZWRfYXQ6dC51cGRhdGVkQXQsIGNvbXBsZXRlZF9hdDp0LmNvbXBsZXRlZEF0LCBhcmNoaXZlZF9hdDp0LmFyY2hpdmVkQXQsIG93bmVyOidzdW11ZHUnfTsKfQpmdW5jdGlvbiByb3dUb1Rhc2socil7CiAgcmV0dXJuIHtpZDpyLmlkLCB0YXNrTmFtZTpyLnRhc2tfbmFtZSwgZGVzY3JpcHRpb246ci5kZXNjcmlwdGlvbnx8JycsIHN0YXR1czpyLnN0YXR1c3x8J3BlbmRpbmcnLAogICAgaXNVcmdlbnQ6ISFyLmlzX3VyZ2VudCwgbm90ZXM6ci5ub3Rlc3x8JycsIGNvbW1lbnRzOnIuY29tbWVudHN8fFtdLCBkdWVEYXRlOnIuZHVlX2RhdGV8fCcnLCBjYXRlZ29yeTpyLmNhdGVnb3J5fHwnJywKICAgIGNyZWF0ZWRBdDpyLmNyZWF0ZWRfYXQsIHVwZGF0ZWRBdDpyLnVwZGF0ZWRfYXQsIGNvbXBsZXRlZEF0OnIuY29tcGxldGVkX2F0LCBhcmNoaXZlZEF0OnIuYXJjaGl2ZWRfYXR9Owp9Cgphc3luYyBmdW5jdGlvbiBsb2FkVGFza3NGcm9tREIoKSB7CiAgY29uc3Qge2RhdGEsZXJyb3J9ID0gYXdhaXQgZGxtU2IuZnJvbSgnZmZfZHV0eV9saXN0Jykuc2VsZWN0KCcqJykuZXEoJ293bmVyJywnc3VtdWR1Jykub3JkZXIoJ2NyZWF0ZWRfYXQnLHthc2NlbmRpbmc6ZmFsc2V9KTsKICBpZihlcnJvcil7Y29uc29sZS5lcnJvcignTG9hZCBlcnJvcjonLGVycm9yKTsgcmV0dXJuIG51bGw7fQogIHJldHVybiBkYXRhID8gZGF0YS5tYXAocm93VG9UYXNrKSA6IG51bGw7Cn0KCmFzeW5jIGZ1bmN0aW9uIHNhdmVUYXNrVG9EQih0YXNrKSB7CiAgYXdhaXQgZGxtU2IuZnJvbSgnZmZfZHV0eV9saXN0JykudXBzZXJ0KHRhc2tUb1Jvdyh0YXNrKSk7Cn0KCmFzeW5jIGZ1bmN0aW9uIGRlbGV0ZVRhc2tGcm9tREIoaWQpIHsKICBhd2FpdCBkbG1TYi5mcm9tKCdmZl9kdXR5X2xpc3QnKS5kZWxldGUoKS5lcSgnaWQnLGlkKTsKfQoKYXN5bmMgZnVuY3Rpb24gc2F2ZUFsbFRhc2tzVG9EQih0YXNrcykgewogIGZvcihjb25zdCB0IG9mIHRhc2tzKXsgYXdhaXQgc2F2ZVRhc2tUb0RCKHQpOyB9Cn0KCmZ1bmN0aW9uIGxvYWRUYXNrcygpIHsKICB0cnkgewogICAgY29uc3QgcmF3ID0gbG9jYWxTdG9yYWdlLmdldEl0ZW0oJ2RsbV90YXNrcycpOwogICAgcmV0dXJuIHJhdyA/IEpTT04ucGFyc2UocmF3KSA6IG51bGw7CiAgfSBjYXRjaCB7IHJldHVybiBudWxsOyB9Cn0KCmZ1bmN0aW9uIHNhdmVUYXNrcyh0YXNrcykgewogIGxvY2FsU3RvcmFnZS5zZXRJdGVtKCdkbG1fdGFza3MnLCBKU09OLnN0cmluZ2lmeSh0YXNrcykpOwp9CgpmdW5jdGlvbiBsb2FkVGhlbWUoKSB7CiAgcmV0dXJuIGxvY2FsU3RvcmFnZS5nZXRJdGVtKCdkbG1fdGhlbWUnKSB8fAogICAgKHdpbmRvdy5tYXRjaE1lZGlhKCcocHJlZmVycy1jb2xvci1zY2hlbWU6IGRhcmspJykubWF0Y2hlcyA/ICdkYXJrJyA6ICdsaWdodCcpOwp9CgpmdW5jdGlvbiBzYXZlVGhlbWUodGhlbWUpIHsKICBsb2NhbFN0b3JhZ2Uuc2V0SXRlbSgnZGxtX3RoZW1lJywgdGhlbWUpOwp9CgpmdW5jdGlvbiBzZWVkU2FtcGxlVGFza3MoKSB7CiAgY29uc3Qgbm93ID0gbm93SVNPKCk7CiAgY29uc3QgaW5GaXZlRGF5cyA9IG5ldyBEYXRlKERhdGUubm93KCkgKyA1ICogMjQgKiA2MCAqIDYwICogMTAwMCkudG9JU09TdHJpbmcoKS5zbGljZSgwLCAxMCk7CiAgY29uc3QgaW5Ud29EYXlzID0gbmV3IERhdGUoRGF0ZS5ub3coKSArIDIgKiAyNCAqIDYwICogNjAgKiAxMDAwKS50b0lTT1N0cmluZygpLnNsaWNlKDAsIDEwKTsKICByZXR1cm4gWwogICAgewogICAgICBpZDogdWlkKCksIHRhc2tOYW1lOiAnQ2FsbCBzdXBwbGllciBhYm91dCBkZWxheWVkIHNoaXBtZW50JywgZGVzY3JpcHRpb246ICdGb2xsb3cgdXAgb24gdGhlIG9yZGVyIHBsYWNlZCBsYXN0IHdlZWsuJywKICAgICAgc3RhdHVzOiAncGVuZGluZycsIGlzVXJnZW50OiB0cnVlLCBub3RlczogJycsIGNvbW1lbnRzOiBbXSwgZHVlRGF0ZTogaW5Ud29EYXlzLAogICAgICBjcmVhdGVkQXQ6IG5vdywgdXBkYXRlZEF0OiBub3csIGNvbXBsZXRlZEF0OiBudWxsLCBhcmNoaXZlZEF0OiBudWxsLAogICAgfSwKICAgIHsKICAgICAgaWQ6IHVpZCgpLCB0YXNrTmFtZTogJ1ByZXBhcmUgbW9udGhseSByZXBvcnQnLCBkZXNjcmlwdGlvbjogJ1N1bW1hcml6ZSBzYWxlcyBhbmQgZXhwZW5zZXMgZm9yIHRoZSBtb250aC4nLAogICAgICBzdGF0dXM6ICdpbl9wcm9ncmVzcycsIGlzVXJnZW50OiBmYWxzZSwgbm90ZXM6ICcnLCBjb21tZW50czogW10sIGR1ZURhdGU6IGluRml2ZURheXMsCiAgICAgIGNyZWF0ZWRBdDogbm93LCB1cGRhdGVkQXQ6IG5vdywgY29tcGxldGVkQXQ6IG51bGwsIGFyY2hpdmVkQXQ6IG51bGwsCiAgICB9LAogICAgewogICAgICBpZDogdWlkKCksIHRhc2tOYW1lOiAnUmV2aWV3IGludm9pY2VzJywgZGVzY3JpcHRpb246ICdDaGVjayBvdXRzdGFuZGluZyBpbnZvaWNlcyBhbmQgbWFyayBwYWlkIG9uZXMuJywKICAgICAgc3RhdHVzOiAncGVuZGluZycsIGlzVXJnZW50OiBmYWxzZSwgbm90ZXM6ICcnLCBjb21tZW50czogW10sIGR1ZURhdGU6ICcnLAogICAgICBjcmVhdGVkQXQ6IG5vdywgdXBkYXRlZEF0OiBub3csIGNvbXBsZXRlZEF0OiBudWxsLCBhcmNoaXZlZEF0OiBudWxsLAogICAgfSwKICBdOwp9Cjwvc2NyaXB0Pgo8c2NyaXB0PgovLyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KLy8gQXBwbGljYXRpb24gc3RhdGUKLy8gLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCmNvbnN0IHN0YXRlID0gewogIHRoZW1lOiBsb2FkVGhlbWUoKSwKICB0YXNrczogW10sCiAgdmlldzogJ2FsbCcsIC8vICdhbGwnIHwgJ3VyZ2VudCcgfCAnb3ZlcmR1ZScgfCAnYXJjaGl2ZScKICBzZWFyY2g6ICcnLAogIHF1aWNrQWRkVXJnZW50OiBmYWxzZSwKICBlZGl0aW5nVGFza0lkOiBudWxsLAogIGxhc3RUb3VjaGVkVGFza0lkOiBudWxsLAp9OwoKY29uc3QgQVJDSElWRV9SRVRFTlRJT05fREFZUyA9IDMwOwoKZnVuY3Rpb24gYXBwbHlUaGVtZSgpIHsKICBkb2N1bWVudC5kb2N1bWVudEVsZW1lbnQuY2xhc3NMaXN0LnRvZ2dsZSgnZGFyaycsIHN0YXRlLnRoZW1lID09PSAnZGFyaycpOwogIHNhdmVUaGVtZShzdGF0ZS50aGVtZSk7Cn0KCmZ1bmN0aW9uIHRvZ2dsZVRoZW1lKCkgewogIHN0YXRlLnRoZW1lID0gc3RhdGUudGhlbWUgPT09ICdkYXJrJyA/ICdsaWdodCcgOiAnZGFyayc7CiAgYXBwbHlUaGVtZSgpOwp9CgovLyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KLy8gVGFzayBDUlVEIChvcGVyYXRlcyBvbiBzdGF0ZS50YXNrcywgcGVyc2lzdHMgdG8gbG9jYWxTdG9yYWdlKQovLyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KZnVuY3Rpb24gcGVyc2lzdFRhc2tzKCkgewogIHNhdmVUYXNrcyhzdGF0ZS50YXNrcyk7CiAgc2F2ZUFsbFRhc2tzVG9EQihzdGF0ZS50YXNrcyk7Cn0KCmZ1bmN0aW9uIGdldFRhc2tCeUlkKGlkKSB7CiAgcmV0dXJuIHN0YXRlLnRhc2tzLmZpbmQoKHQpID0+IHQuaWQgPT09IGlkKTsKfQoKZnVuY3Rpb24gY3JlYXRlVGFzayh7IHRhc2tOYW1lLCBkZXNjcmlwdGlvbiA9ICcnLCBzdGF0dXMgPSAncGVuZGluZycsIGlzVXJnZW50ID0gZmFsc2UsIG5vdGVzID0gJycsIGR1ZURhdGUgPSAnJyB9KSB7CiAgY29uc3Qgbm93ID0gbm93SVNPKCk7CiAgY29uc3QgdGFzayA9IHsKICAgIGlkOiB1aWQoKSwKICAgIHRhc2tOYW1lOiB0YXNrTmFtZS50cmltKCksCiAgICBkZXNjcmlwdGlvbjogKGRlc2NyaXB0aW9uIHx8ICcnKS50cmltKCksCiAgICBzdGF0dXM6IFsncGVuZGluZycsICdpbl9wcm9ncmVzcycsICdjb21wbGV0ZWQnXS5pbmNsdWRlcyhzdGF0dXMpID8gc3RhdHVzIDogJ3BlbmRpbmcnLAogICAgaXNVcmdlbnQ6ICEhaXNVcmdlbnQsCiAgICBub3RlczogKG5vdGVzIHx8ICcnKS50cmltKCksCiAgICBkdWVEYXRlOiAoZHVlRGF0ZSB8fCAnJykudHJpbSgpLAogICAgY29tbWVudHM6IFtdLAogICAgY3JlYXRlZEF0OiBub3csCiAgICB1cGRhdGVkQXQ6IG5vdywKICAgIGNvbXBsZXRlZEF0OiBzdGF0dXMgPT09ICdjb21wbGV0ZWQnID8gbm93IDogbnVsbCwKICAgIGFyY2hpdmVkQXQ6IG51bGwsCiAgfTsKICBzdGF0ZS50YXNrcy51bnNoaWZ0KHRhc2spOwogIHNhdmVUYXNrcyhzdGF0ZS50YXNrcyk7CiAgc2F2ZVRhc2tUb0RCKHRhc2spOwogIHJldHVybiB0YXNrOwp9CgpmdW5jdGlvbiB1cGRhdGVUYXNrKGlkLCB1cGRhdGVzKSB7CiAgY29uc3QgdGFzayA9IGdldFRhc2tCeUlkKGlkKTsKICBpZiAoIXRhc2spIHJldHVybiBudWxsOwoKICBpZiAodXBkYXRlcy50YXNrTmFtZSAhPT0gdW5kZWZpbmVkKSB0YXNrLnRhc2tOYW1lID0gdXBkYXRlcy50YXNrTmFtZS50cmltKCk7CiAgaWYgKHVwZGF0ZXMuZGVzY3JpcHRpb24gIT09IHVuZGVmaW5lZCkgdGFzay5kZXNjcmlwdGlvbiA9IHVwZGF0ZXMuZGVzY3JpcHRpb247CiAgaWYgKHVwZGF0ZXMubm90ZXMgIT09IHVuZGVmaW5lZCkgdGFzay5ub3RlcyA9IHVwZGF0ZXMubm90ZXM7CiAgaWYgKHVwZGF0ZXMuZHVlRGF0ZSAhPT0gdW5kZWZpbmVkKSB0YXNrLmR1ZURhdGUgPSB1cGRhdGVzLmR1ZURhdGU7CiAgaWYgKHVwZGF0ZXMuaXNVcmdlbnQgIT09IHVuZGVmaW5lZCkgdGFzay5pc1VyZ2VudCA9ICEhdXBkYXRlcy5pc1VyZ2VudDsKCiAgaWYgKHVwZGF0ZXMuc3RhdHVzICE9PSB1bmRlZmluZWQgJiYgWydwZW5kaW5nJywgJ2luX3Byb2dyZXNzJywgJ2NvbXBsZXRlZCddLmluY2x1ZGVzKHVwZGF0ZXMuc3RhdHVzKSkgewogICAgY29uc3Qgd2FzQ29tcGxldGVkID0gdGFzay5zdGF0dXMgPT09ICdjb21wbGV0ZWQnOwogICAgY29uc3Qgd2lsbEJlQ29tcGxldGVkID0gdXBkYXRlcy5zdGF0dXMgPT09ICdjb21wbGV0ZWQnOwogICAgdGFzay5zdGF0dXMgPSB1cGRhdGVzLnN0YXR1czsKICAgIGlmICh3aWxsQmVDb21wbGV0ZWQgJiYgIXdhc0NvbXBsZXRlZCkgewogICAgICB0YXNrLmNvbXBsZXRlZEF0ID0gbm93SVNPKCk7CiAgICAgIHRhc2suYXJjaGl2ZWRBdCA9IG5vd0lTTygpOyAvLyBjb21wbGV0aW5nIGEgdGFzayBhcmNoaXZlcyBpdAogICAgfSBlbHNlIGlmICghd2lsbEJlQ29tcGxldGVkICYmIHdhc0NvbXBsZXRlZCkgewogICAgICB0YXNrLmNvbXBsZXRlZEF0ID0gbnVsbDsKICAgICAgdGFzay5hcmNoaXZlZEF0ID0gbnVsbDsKICAgIH0KICB9CgogIHRhc2sudXBkYXRlZEF0ID0gbm93SVNPKCk7CiAgc2F2ZVRhc2tzKHN0YXRlLnRhc2tzKTsKICBzYXZlVGFza1RvREIodGFzayk7CiAgcmV0dXJuIHRhc2s7Cn0KCmZ1bmN0aW9uIGRlbGV0ZVRhc2soaWQpIHsKICBzdGF0ZS50YXNrcyA9IHN0YXRlLnRhc2tzLmZpbHRlcigodCkgPT4gdC5pZCAhPT0gaWQpOwogIHNhdmVUYXNrcyhzdGF0ZS50YXNrcyk7CiAgZGVsZXRlVGFza0Zyb21EQihpZCk7Cn0KCmZ1bmN0aW9uIHRvZ2dsZUNvbXBsZXRlKGlkKSB7CiAgY29uc3QgdGFzayA9IGdldFRhc2tCeUlkKGlkKTsKICBpZiAoIXRhc2spIHJldHVybjsKICB1cGRhdGVUYXNrKGlkLCB7IHN0YXR1czogdGFzay5zdGF0dXMgPT09ICdjb21wbGV0ZWQnID8gJ3BlbmRpbmcnIDogJ2NvbXBsZXRlZCcgfSk7Cn0KCmZ1bmN0aW9uIGFyY2hpdmVUYXNrKGlkKSB7CiAgY29uc3QgdGFzayA9IGdldFRhc2tCeUlkKGlkKTsKICBpZiAoIXRhc2spIHJldHVybjsKICB0YXNrLnN0YXR1cyA9ICdjb21wbGV0ZWQnOwogIHRhc2suY29tcGxldGVkQXQgPSB0YXNrLmNvbXBsZXRlZEF0IHx8IG5vd0lTTygpOwogIHRhc2suYXJjaGl2ZWRBdCA9IG5vd0lTTygpOwogIHRhc2sudXBkYXRlZEF0ID0gbm93SVNPKCk7CiAgcGVyc2lzdFRhc2tzKCk7Cn0KCmZ1bmN0aW9uIHJlc3RvcmVGcm9tQXJjaGl2ZShpZCkgewogIGNvbnN0IHRhc2sgPSBnZXRUYXNrQnlJZChpZCk7CiAgaWYgKCF0YXNrKSByZXR1cm47CiAgdGFzay5zdGF0dXMgPSAncGVuZGluZyc7CiAgdGFzay5jb21wbGV0ZWRBdCA9IG51bGw7CiAgdGFzay5hcmNoaXZlZEF0ID0gbnVsbDsKICB0YXNrLnVwZGF0ZWRBdCA9IG5vd0lTTygpOwogIHBlcnNpc3RUYXNrcygpOwp9CgpmdW5jdGlvbiB0b2dnbGVVcmdlbnQoaWQpIHsKICBjb25zdCB0YXNrID0gZ2V0VGFza0J5SWQoaWQpOwogIGlmICghdGFzaykgcmV0dXJuOwogIHVwZGF0ZVRhc2soaWQsIHsgaXNVcmdlbnQ6ICF0YXNrLmlzVXJnZW50IH0pOwp9CgpmdW5jdGlvbiBhZGRDb21tZW50KHRhc2tJZCwgY29udGVudCkgewogIGNvbnN0IHRhc2sgPSBnZXRUYXNrQnlJZCh0YXNrSWQpOwogIGlmICghdGFzayB8fCAhY29udGVudC50cmltKCkpIHJldHVybiBudWxsOwogIGNvbnN0IGNvbW1lbnQgPSB7IGlkOiB1aWQoKSwgY29udGVudDogY29udGVudC50cmltKCksIGNyZWF0ZWRBdDogbm93SVNPKCkgfTsKICB0YXNrLmNvbW1lbnRzLnB1c2goY29tbWVudCk7CiAgdGFzay51cGRhdGVkQXQgPSBub3dJU08oKTsKICBwZXJzaXN0VGFza3MoKTsKICByZXR1cm4gY29tbWVudDsKfQoKZnVuY3Rpb24gZGVsZXRlQ29tbWVudCh0YXNrSWQsIGNvbW1lbnRJZCkgewogIGNvbnN0IHRhc2sgPSBnZXRUYXNrQnlJZCh0YXNrSWQpOwogIGlmICghdGFzaykgcmV0dXJuOwogIHRhc2suY29tbWVudHMgPSB0YXNrLmNvbW1lbnRzLmZpbHRlcigoYykgPT4gYy5pZCAhPT0gY29tbWVudElkKTsKICB0YXNrLnVwZGF0ZWRBdCA9IG5vd0lTTygpOwogIHBlcnNpc3RUYXNrcygpOwp9CgovLyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KLy8gQXV0by1kZWxldGUgYXJjaGl2ZWQgdGFza3MgYWZ0ZXIgQVJDSElWRV9SRVRFTlRJT05fREFZUyBkYXlzCi8vIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQpmdW5jdGlvbiBwdXJnZUV4cGlyZWRBcmNoaXZlZFRhc2tzKCkgewogIGNvbnN0IGN1dG9mZiA9IERhdGUubm93KCkgLSBBUkNISVZFX1JFVEVOVElPTl9EQVlTICogMjQgKiA2MCAqIDYwICogMTAwMDsKICBjb25zdCBiZWZvcmUgPSBzdGF0ZS50YXNrcy5sZW5ndGg7CiAgc3RhdGUudGFza3MgPSBzdGF0ZS50YXNrcy5maWx0ZXIoKHQpID0+IHsKICAgIGlmICghdC5hcmNoaXZlZEF0KSByZXR1cm4gdHJ1ZTsKICAgIHJldHVybiBuZXcgRGF0ZSh0LmFyY2hpdmVkQXQpLmdldFRpbWUoKSA+PSBjdXRvZmY7CiAgfSk7CiAgaWYgKHN0YXRlLnRhc2tzLmxlbmd0aCAhPT0gYmVmb3JlKSBzYXZlVGFza3Moc3RhdGUudGFza3MpOwp9CgpmdW5jdGlvbiBkYXlzVW50aWxQdXJnZSh0YXNrKSB7CiAgaWYgKCF0YXNrLmFyY2hpdmVkQXQpIHJldHVybiBudWxsOwogIGNvbnN0IGFyY2hpdmVkVGltZSA9IG5ldyBEYXRlKHRhc2suYXJjaGl2ZWRBdCkuZ2V0VGltZSgpOwogIGNvbnN0IHB1cmdlVGltZSA9IGFyY2hpdmVkVGltZSArIEFSQ0hJVkVfUkVURU5USU9OX0RBWVMgKiAyNCAqIDYwICogNjAgKiAxMDAwOwogIGNvbnN0IGRheXNMZWZ0ID0gTWF0aC5jZWlsKChwdXJnZVRpbWUgLSBEYXRlLm5vdygpKSAvICgyNCAqIDYwICogNjAgKiAxMDAwKSk7CiAgcmV0dXJuIE1hdGgubWF4KGRheXNMZWZ0LCAwKTsKfQoKLy8gLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCi8vIEZpbHRlcmluZywgc29ydGluZyAmIHN0YXRzCi8vIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQpjb25zdCBTVEFUVVNfT1JERVIgPSB7IHBlbmRpbmc6IDAsIGluX3Byb2dyZXNzOiAxLCBjb21wbGV0ZWQ6IDIgfTsKCmZ1bmN0aW9uIGlzT3ZlcmR1ZSh0YXNrKSB7CiAgaWYgKCF0YXNrLmR1ZURhdGUgfHwgdGFzay5zdGF0dXMgPT09ICdjb21wbGV0ZWQnIHx8IHRhc2suYXJjaGl2ZWRBdCkgcmV0dXJuIGZhbHNlOwogIGNvbnN0IHRvZGF5ID0gbmV3IERhdGUoKS50b0lTT1N0cmluZygpLnNsaWNlKDAsIDEwKTsKICByZXR1cm4gdGFzay5kdWVEYXRlIDwgdG9kYXk7Cn0KCmZ1bmN0aW9uIGlzRHVlVG9kYXkodGFzaykgewogIGlmICghdGFzay5kdWVEYXRlIHx8IHRhc2suc3RhdHVzID09PSAnY29tcGxldGVkJyB8fCB0YXNrLmFyY2hpdmVkQXQpIHJldHVybiBmYWxzZTsKICBjb25zdCB0b2RheSA9IG5ldyBEYXRlKCkudG9JU09TdHJpbmcoKS5zbGljZSgwLCAxMCk7CiAgcmV0dXJuIHRhc2suZHVlRGF0ZSA9PT0gdG9kYXk7Cn0KCmZ1bmN0aW9uIGdldFRhc2tzRm9yVmlldyh2aWV3KSB7CiAgLy8gIkFsbCBUYXNrcyIgcGFuZWwgPSBhY3RpdmUgKG5vbi1hcmNoaXZlZCkgdGFza3MsIHVyZ2VudCBvciBub3QsIGFueSBzdGF0dXMgZXhjZXB0IGNvbXBsZXRlZC9hcmNoaXZlZC4KICAvLyAiVXJnZW50IiBwYW5lbCA9IGFjdGl2ZSB0YXNrcyBtYXJrZWQgdXJnZW50LgogIC8vICJPdmVyZHVlIiBwYW5lbCA9IGFjdGl2ZSB0YXNrcyB3aG9zZSBkdWUgZGF0ZSBoYXMgcGFzc2VkLgogIC8vICJBcmNoaXZlIiBwYW5lbCA9IGNvbXBsZXRlZCAvIGFyY2hpdmVkIHRhc2tzLgogIGlmICh2aWV3ID09PSAnYXJjaGl2ZScpIHsKICAgIHJldHVybiBzdGF0ZS50YXNrcy5maWx0ZXIoKHQpID0+ICEhdC5hcmNoaXZlZEF0KTsKICB9CiAgaWYgKHZpZXcgPT09ICdqb3NodWEnKSB7CiAgICByZXR1cm4gc3RhdGUudGFza3MuZmlsdGVyKCh0KSA9PiAhdC5hcmNoaXZlZEF0ICYmIHQuY2F0ZWdvcnkgPT09ICdqb3NodWEnKTsKICB9CiAgaWYgKHZpZXcgPT09ICd1cmdlbnQnKSB7CiAgICByZXR1cm4gc3RhdGUudGFza3MuZmlsdGVyKCh0KSA9PiAhdC5hcmNoaXZlZEF0ICYmIHQuaXNVcmdlbnQpOwogIH0KICBpZiAodmlldyA9PT0gJ292ZXJkdWUnKSB7CiAgICByZXR1cm4gc3RhdGUudGFza3MuZmlsdGVyKCh0KSA9PiAhdC5hcmNoaXZlZEF0ICYmIGlzT3ZlcmR1ZSh0KSk7CiAgfQogIC8vIGFsbCAoZGVmYXVsdCkKICByZXR1cm4gc3RhdGUudGFza3MuZmlsdGVyKCh0KSA9PiAhdC5hcmNoaXZlZEF0KTsKfQoKZnVuY3Rpb24gZ2V0RmlsdGVyZWRTb3J0ZWRUYXNrcygpIHsKICBsZXQgbGlzdCA9IGdldFRhc2tzRm9yVmlldyhzdGF0ZS52aWV3KTsKCiAgaWYgKHN0YXRlLnNlYXJjaC50cmltKCkpIHsKICAgIGNvbnN0IHRlcm0gPSBzdGF0ZS5zZWFyY2gudHJpbSgpLnRvTG93ZXJDYXNlKCk7CiAgICBsaXN0ID0gbGlzdC5maWx0ZXIoKHQpID0+CiAgICAgIHQudGFza05hbWUudG9Mb3dlckNhc2UoKS5pbmNsdWRlcyh0ZXJtKSB8fAogICAgICAodC5kZXNjcmlwdGlvbiB8fCAnJykudG9Mb3dlckNhc2UoKS5pbmNsdWRlcyh0ZXJtKSB8fAogICAgICAodC5ub3RlcyB8fCAnJykudG9Mb3dlckNhc2UoKS5pbmNsdWRlcyh0ZXJtKQogICAgKTsKICB9CgogIGxpc3Quc29ydCgoYSwgYikgPT4gewogICAgaWYgKHN0YXRlLnZpZXcgPT09ICdhcmNoaXZlJykgewogICAgICByZXR1cm4gbmV3IERhdGUoYi5hcmNoaXZlZEF0KSAtIG5ldyBEYXRlKGEuYXJjaGl2ZWRBdCk7CiAgICB9CiAgICBpZiAoc3RhdGUudmlldyA9PT0gJ292ZXJkdWUnKSB7CiAgICAgIC8vIE1vc3Qgb3ZlcmR1ZSAob2xkZXN0IGR1ZSBkYXRlKSBmaXJzdAogICAgICByZXR1cm4gYS5kdWVEYXRlIDwgYi5kdWVEYXRlID8gLTEgOiBhLmR1ZURhdGUgPiBiLmR1ZURhdGUgPyAxIDogMDsKICAgIH0KICAgIGlmIChhLmlzVXJnZW50ICE9PSBiLmlzVXJnZW50KSByZXR1cm4gYS5pc1VyZ2VudCA/IC0xIDogMTsKICAgIGNvbnN0IHNhID0gU1RBVFVTX09SREVSW2Euc3RhdHVzXSA/PyAzOwogICAgY29uc3Qgc2IgPSBTVEFUVVNfT1JERVJbYi5zdGF0dXNdID8/IDM7CiAgICBpZiAoc2EgIT09IHNiKSByZXR1cm4gc2EgLSBzYjsKICAgIC8vIFRhc2tzIHdpdGggYSBkdWUgZGF0ZSBjb21lIGZpcnN0IChzb29uZXN0IGR1ZSBkYXRlIGZpcnN0KTsgbm8gZHVlIGRhdGUgc29ydHMgbGFzdAogICAgaWYgKGEuZHVlRGF0ZSAmJiBiLmR1ZURhdGUgJiYgYS5kdWVEYXRlICE9PSBiLmR1ZURhdGUpIHJldHVybiBhLmR1ZURhdGUgPCBiLmR1ZURhdGUgPyAtMSA6IDE7CiAgICBpZiAoYS5kdWVEYXRlICYmICFiLmR1ZURhdGUpIHJldHVybiAtMTsKICAgIGlmICghYS5kdWVEYXRlICYmIGIuZHVlRGF0ZSkgcmV0dXJuIDE7CiAgICByZXR1cm4gbmV3IERhdGUoYi5jcmVhdGVkQXQpIC0gbmV3IERhdGUoYS5jcmVhdGVkQXQpOwogIH0pOwoKICByZXR1cm4gbGlzdDsKfQoKZnVuY3Rpb24gY29tcHV0ZVN0YXRzKCkgewogIGNvbnN0IGFjdGl2ZSA9IHN0YXRlLnRhc2tzLmZpbHRlcigodCkgPT4gIXQuYXJjaGl2ZWRBdCk7CiAgY29uc3QgYXJjaGl2ZWQgPSBzdGF0ZS50YXNrcy5maWx0ZXIoKHQpID0+ICEhdC5hcmNoaXZlZEF0KTsKICBjb25zdCB0b3RhbCA9IHN0YXRlLnRhc2tzLmxlbmd0aDsKICBjb25zdCBwZW5kaW5nID0gYWN0aXZlLmZpbHRlcigodCkgPT4gdC5zdGF0dXMgPT09ICdwZW5kaW5nJykubGVuZ3RoOwogIGNvbnN0IGluUHJvZ3Jlc3MgPSBhY3RpdmUuZmlsdGVyKCh0KSA9PiB0LnN0YXR1cyA9PT0gJ2luX3Byb2dyZXNzJykubGVuZ3RoOwogIGNvbnN0IGNvbXBsZXRlZCA9IGFyY2hpdmVkLmxlbmd0aDsKICBjb25zdCB1cmdlbnQgPSBhY3RpdmUuZmlsdGVyKCh0KSA9PiB0LmlzVXJnZW50KS5sZW5ndGg7CiAgY29uc3Qgb3ZlcmR1ZSA9IGFjdGl2ZS5maWx0ZXIoKHQpID0+IGlzT3ZlcmR1ZSh0KSkubGVuZ3RoOwogIGNvbnN0IGpvc2h1YSA9IGFjdGl2ZS5maWx0ZXIoKHQpID0+IHQuY2F0ZWdvcnkgPT09ICdqb3NodWEnKS5sZW5ndGg7CiAgcmV0dXJuIHsgdG90YWwsIHBlbmRpbmcsIGluUHJvZ3Jlc3MsIGNvbXBsZXRlZCwgdXJnZW50LCBvdmVyZHVlLCBqb3NodWEsIGFyY2hpdmVkQ291bnQ6IGFyY2hpdmVkLmxlbmd0aCwgYWN0aXZlQ291bnQ6IGFjdGl2ZS5sZW5ndGggfTsKfQo8L3NjcmlwdD4KPHNjcmlwdD4KLy8gLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCi8vIFRvcC1sZXZlbCByZW5kZXIKLy8gLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCmNvbnN0IHJvb3QgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnYXBwJyk7Cgphc3luYyBmdW5jdGlvbiByZW5kZXIoKSB7CiAgYXBwbHlUaGVtZSgpOwogIGlmIChzdGF0ZS50YXNrcy5sZW5ndGggPT09IDApIHsKICAgIGNvbnN0IGRiVGFza3MgPSBhd2FpdCBsb2FkVGFza3NGcm9tREIoKTsKICAgIGlmKGRiVGFza3MgJiYgZGJUYXNrcy5sZW5ndGggPiAwKXsKICAgICAgc3RhdGUudGFza3MgPSBkYlRhc2tzOwogICAgICBzYXZlVGFza3Moc3RhdGUudGFza3MpOwogICAgfSBlbHNlIHsKICAgICAgY29uc3Qgc3RvcmVkID0gbG9hZFRhc2tzKCk7CiAgICAgIGlmKHN0b3JlZCAmJiBzdG9yZWQubGVuZ3RoID4gMCl7CiAgICAgICAgc3RhdGUudGFza3MgPSBzdG9yZWQ7CiAgICAgICAgc2F2ZUFsbFRhc2tzVG9EQihzdGF0ZS50YXNrcyk7CiAgICAgIH0gZWxzZSB7CiAgICAgICAgc3RhdGUudGFza3MgPSBzZWVkU2FtcGxlVGFza3MoKTsKICAgICAgICBzYXZlVGFza3Moc3RhdGUudGFza3MpOwogICAgICAgIHNhdmVBbGxUYXNrc1RvREIoc3RhdGUudGFza3MpOwogICAgICB9CiAgICB9CiAgfQogIHB1cmdlRXhwaXJlZEFyY2hpdmVkVGFza3MoKTsKICByZW5kZXJEYXNoYm9hcmQoKTsKfQoKLy8gLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCi8vIERhc2hib2FyZCBzaGVsbAovLyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KZnVuY3Rpb24gcmVuZGVyRGFzaGJvYXJkKCkgewogIHJvb3QuaW5uZXJIVE1MID0gYAogICAgPGRpdiBjbGFzcz0ibWluLWgtc2NyZWVuIHBiLTEyIj4KICAgICAgPGhlYWRlciBjbGFzcz0iYmctd2hpdGUvODAgZGFyazpiZy1ncmF5LTk1MC84MCBiYWNrZHJvcC1ibHVyLW1kIGJvcmRlci1iIGJvcmRlci1ncmF5LTIwMCBkYXJrOmJvcmRlci1ncmF5LTgwMCI+CiAgICAgICAgPGRpdiBjbGFzcz0ibWF4LXctNnhsIG14LWF1dG8gcHgtNCBzbTpweC02IHB5LTMgZmxleCBpdGVtcy1jZW50ZXIganVzdGlmeS1iZXR3ZWVuIj4KICAgICAgICAgIDxkaXYgY2xhc3M9ImZsZXggaXRlbXMtY2VudGVyIGdhcC0yLjUiPgogICAgICAgICAgICA8ZGl2IGNsYXNzPSJ3LTkgaC05IHJvdW5kZWQteGwgYmctcHJpbWFyeS02MDAgdGV4dC13aGl0ZSBmbGV4IGl0ZW1zLWNlbnRlciBqdXN0aWZ5LWNlbnRlciBzaGFkb3ctbWQgc2hhZG93LXByaW1hcnktNjAwLzMwIj4KICAgICAgICAgICAgICAke0lDT05TLmNoZWNrfQogICAgICAgICAgICA8L2Rpdj4KICAgICAgICAgIDwvZGl2PgogICAgICAgICAgPGRpdiBjbGFzcz0iZmxleCBpdGVtcy1jZW50ZXIgZ2FwLTIiPgogICAgICAgICAgICA8YnV0dG9uIGlkPSJidG4tdGhlbWUiIHRpdGxlPSJUb2dnbGUgZGFyayBtb2RlIiBjbGFzcz0idy0xMSBoLTExIGZsZXggaXRlbXMtY2VudGVyIGp1c3RpZnktY2VudGVyIHJvdW5kZWQteGwgYmctZ3JheS0xMDAgZGFyazpiZy1ncmF5LTgwMCBob3ZlcjpiZy1ncmF5LTIwMCBkYXJrOmhvdmVyOmJnLWdyYXktNzAwIHRyYW5zaXRpb24tY29sb3JzIj4KICAgICAgICAgICAgICAke3N0YXRlLnRoZW1lID09PSAnZGFyaycgPyBJQ09OUy5zdW4gOiBJQ09OUy5tb29ufQogICAgICAgICAgICA8L2J1dHRvbj4KICAgICAgICAgIDwvZGl2PgogICAgICAgIDwvZGl2PgoKICAgICAgICA8IS0tIFRvcCBuYXZpZ2F0aW9uIHBhbmVsczogQWxsIFRhc2tzIC8gVXJnZW50IC8gT3ZlcmR1ZSAvIEFyY2hpdmUgLS0+CiAgICAgICAgPG5hdiBjbGFzcz0ibWF4LXctNnhsIG14LWF1dG8gcHgtNCBzbTpweC02Ij4KICAgICAgICAgIDxkaXYgaWQ9InRvcC1uYXYtcGFuZWxzIiBjbGFzcz0iZ3JpZCBncmlkLWNvbHMtMiBzbTpncmlkLWNvbHMtNCBnYXAtMiBwYi0yLjUiPjwvZGl2PgogICAgICAgIDwvbmF2PgogICAgICA8L2hlYWRlcj4KCiAgICAgIDxtYWluIGNsYXNzPSJtYXgtdy02eGwgbXgtYXV0byBweC00IHNtOnB4LTYgcHktNSBzbTpweS04IHNwYWNlLXktNSBzbTpzcGFjZS15LTYiPgogICAgICAgIDwhLS0gUXVpY2sgQWRkIC0tPgogICAgICAgIDxkaXYgY2xhc3M9ImJnLXdoaXRlIGRhcms6YmctZ3JheS05MDAgYm9yZGVyIGJvcmRlci1ncmF5LTEwMCBkYXJrOmJvcmRlci1ncmF5LTgwMCByb3VuZGVkLTJ4bCBzaGFkb3ctc20gcC00IHNtOnAtNSI+CiAgICAgICAgICA8ZGl2IGNsYXNzPSJmbGV4IGl0ZW1zLWNlbnRlciBqdXN0aWZ5LWJldHdlZW4gZmxleC13cmFwIGdhcC0yIG1iLTIiPgogICAgICAgICAgICA8bGFiZWwgY2xhc3M9ImZsZXggaXRlbXMtY2VudGVyIGdhcC0yIHRleHQtc20gZm9udC1zZW1pYm9sZCB0ZXh0LWdyYXktNjAwIGRhcms6dGV4dC1ncmF5LTMwMCI+CiAgICAgICAgICAgICAgJHtJQ09OUy5wbHVzLnJlcGxhY2UoJ2ljb24nLCAnaWNvbi1zbScpfSA8c3BhbiBjbGFzcz0idGV4dC1wcmltYXJ5LTYwMCBkYXJrOnRleHQtcHJpbWFyeS00MDAiPlF1aWNrIEFkZCBUYXNrPC9zcGFuPgogICAgICAgICAgICA8L2xhYmVsPgogICAgICAgICAgICA8ZGl2IGNsYXNzPSJmbGV4IGl0ZW1zLWNlbnRlciBnYXAtMiBmbGV4LXdyYXAiPgogICAgICAgICAgICAgIDxsYWJlbCBjbGFzcz0iZmxleCBpdGVtcy1jZW50ZXIgZ2FwLTEuNSB0ZXh0LXNtIGZvbnQtc2VtaWJvbGQgcHgtMyBweS0xLjUgcm91bmRlZC1mdWxsIGJnLWdyYXktMTAwIGRhcms6YmctZ3JheS04MDAgdGV4dC1ncmF5LTUwMCBkYXJrOnRleHQtZ3JheS00MDAiPgogICAgICAgICAgICAgICAgJHtJQ09OUy5jbG9jay5yZXBsYWNlKCdpY29uJywnaWNvbi1zbScpfQogICAgICAgICAgICAgICAgPGlucHV0IHR5cGU9ImRhdGUiIGlkPSJxdWljay1hZGQtZHVlLWRhdGUiIGNsYXNzPSJiZy10cmFuc3BhcmVudCBvdXRsaW5lLW5vbmUgdGV4dC1ncmF5LTcwMCBkYXJrOnRleHQtZ3JheS0yMDAiIC8+CiAgICAgICAgICAgICAgPC9sYWJlbD4KICAgICAgICAgICAgICA8bGFiZWwgaWQ9InF1aWNrLWFkZC11cmdlbnQtbGFiZWwiIGNsYXNzPSJmbGV4IGl0ZW1zLWNlbnRlciBnYXAtMiB0ZXh0LXNtIGZvbnQtc2VtaWJvbGQgY3Vyc29yLXBvaW50ZXIgc2VsZWN0LW5vbmUgcHgtMyBweS0xLjUgcm91bmRlZC1mdWxsIHRyYW5zaXRpb24tY29sb3JzICR7CiAgICAgICAgICAgICAgICBzdGF0ZS5xdWlja0FkZFVyZ2VudAogICAgICAgICAgICAgICAgICA/ICdiZy1yZWQtNjAwIHRleHQtd2hpdGUgc2hhZG93LW1kIHNoYWRvdy1yZWQtNjAwLzMwJwogICAgICAgICAgICAgICAgICA6ICdiZy1ncmF5LTEwMCBkYXJrOmJnLWdyYXktODAwIHRleHQtZ3JheS01MDAgZGFyazp0ZXh0LWdyYXktNDAwIGhvdmVyOmJnLWdyYXktMjAwIGRhcms6aG92ZXI6YmctZ3JheS03MDAnCiAgICAgICAgICAgICAgfSI+CiAgICAgICAgICAgICAgICA8aW5wdXQgdHlwZT0iY2hlY2tib3giIGlkPSJxdWljay1hZGQtdXJnZW50IiBjbGFzcz0iZGxtLWNoZWNrYm94IiAke3N0YXRlLnF1aWNrQWRkVXJnZW50ID8gJ2NoZWNrZWQnIDogJyd9IC8+CiAgICAgICAgICAgICAgICAke0lDT05TLmFsZXJ0LnJlcGxhY2UoJ2ljb24nLCdpY29uLXNtJyl9IE1hcmsgYXMgVXJnZW50CiAgICAgICAgICAgICAgPC9sYWJlbD4KICAgICAgICAgICAgPC9kaXY+CiAgICAgICAgICA8L2Rpdj4KICAgICAgICAgIDxkaXYgY2xhc3M9InJlbGF0aXZlIj4KICAgICAgICAgICAgPHRleHRhcmVhIGlkPSJxdWljay1hZGQtaW5wdXQiIHJvd3M9IjIiIHBsYWNlaG9sZGVyPSJDYWxsIHN1cHBsaWVyClByZXBhcmUgbW9udGhseSByZXBvcnQKUmV2aWV3IGludm9pY2VzCgpUeXBlIGEgdGFzayBhbmQgcHJlc3MgRW50ZXIgdG8gYWRkIGl0IGluc3RhbnRseS4uLiIKICAgICAgICAgICAgICBjbGFzcz0idy1mdWxsIHJlc2l6ZS1ub25lIHRleHQtbGcgcHgtNCBweS0zLjUgcm91bmRlZC14bCBib3JkZXIgYm9yZGVyLWdyYXktMjAwIGRhcms6Ym9yZGVyLWdyYXktNzAwIGJnLWdyYXktNTAgZGFyazpiZy1ncmF5LTgwMCBmb2N1czpiZy13aGl0ZSBkYXJrOmZvY3VzOmJnLWdyYXktOTAwIHRyYW5zaXRpb24tY29sb3JzIG91dGxpbmUtbm9uZSBmb2N1czpyaW5nLTIgZm9jdXM6cmluZy1wcmltYXJ5LTUwMCI+PC90ZXh0YXJlYT4KICAgICAgICAgIDwvZGl2PgogICAgICAgICAgPHAgY2xhc3M9InRleHQteHMgdGV4dC1ncmF5LTQwMCBtdC0xLjUiPgogICAgICAgICAgICBQcmVzcyA8a2JkIGNsYXNzPSJweC0xLjUgcHktMC41IHJvdW5kZWQgYmctZ3JheS0xMDAgZGFyazpiZy1ncmF5LTgwMCBib3JkZXIgYm9yZGVyLWdyYXktMjAwIGRhcms6Ym9yZGVyLWdyYXktNzAwIj5FbnRlcjwva2JkPiB0byBhZGQgJm1pZGRvdDsgPGtiZCBjbGFzcz0icHgtMS41IHB5LTAuNSByb3VuZGVkIGJnLWdyYXktMTAwIGRhcms6YmctZ3JheS04MDAgYm9yZGVyIGJvcmRlci1ncmF5LTIwMCBkYXJrOmJvcmRlci1ncmF5LTcwMCI+Q3RybCtOPC9rYmQ+IHRvIGp1bXAgaGVyZSAmbWlkZG90OyBkdWUgZGF0ZSBhcHBsaWVzIHRvIGFsbCB0YXNrcyBhZGRlZCB0b2dldGhlcgogICAgICAgICAgPC9wPgogICAgICAgIDwvZGl2PgoKICAgICAgICA8ZGl2IGlkPSJ0b2FzdC1jb250YWluZXIiPjwvZGl2PgoKICAgICAgICA8IS0tIFNlYXJjaCAtLT4KICAgICAgICA8ZGl2IGNsYXNzPSJiZy13aGl0ZSBkYXJrOmJnLWdyYXktOTAwIGJvcmRlciBib3JkZXItZ3JheS0xMDAgZGFyazpib3JkZXItZ3JheS04MDAgcm91bmRlZC0yeGwgc2hhZG93LXNtIHAtNCBzbTpwLTUiPgogICAgICAgICAgPGRpdiBjbGFzcz0icmVsYXRpdmUiPgogICAgICAgICAgICA8c3BhbiBjbGFzcz0iYWJzb2x1dGUgbGVmdC0zIHRvcC0xLzIgLXRyYW5zbGF0ZS15LTEvMiB0ZXh0LWdyYXktNDAwIj4ke0lDT05TLnNlYXJjaH08L3NwYW4+CiAgICAgICAgICAgIDxpbnB1dCBpZD0ic2VhcmNoLWlucHV0IiB0eXBlPSJ0ZXh0IiBwbGFjZWhvbGRlcj0iU2VhcmNoIHRhc2tzLi4uIChwcmVzcyAvIHRvIGZvY3VzKSIgdmFsdWU9IiR7ZXNjYXBlSHRtbChzdGF0ZS5zZWFyY2gpfSIKICAgICAgICAgICAgICBjbGFzcz0idy1mdWxsIHBsLTExIHByLTEwIHB5LTMgdGV4dC1sZyByb3VuZGVkLXhsIGJvcmRlciBib3JkZXItZ3JheS0yMDAgZGFyazpib3JkZXItZ3JheS03MDAgYmctZ3JheS01MCBkYXJrOmJnLWdyYXktODAwIGZvY3VzOmJnLXdoaXRlIGRhcms6Zm9jdXM6YmctZ3JheS05MDAgdHJhbnNpdGlvbi1jb2xvcnMgb3V0bGluZS1ub25lIGZvY3VzOnJpbmctMiBmb2N1czpyaW5nLXByaW1hcnktNTAwIiAvPgogICAgICAgICAgICA8YnV0dG9uIGlkPSJzZWFyY2gtY2xlYXIiIGNsYXNzPSJhYnNvbHV0ZSByaWdodC0zIHRvcC0xLzIgLXRyYW5zbGF0ZS15LTEvMiB0ZXh0LWdyYXktNDAwIGhvdmVyOnRleHQtZ3JheS02MDAgJHtzdGF0ZS5zZWFyY2ggPyAnJyA6ICdoaWRkZW4nfSI+JHtJQ09OUy54fTwvYnV0dG9uPgogICAgICAgICAgPC9kaXY+CiAgICAgICAgPC9kaXY+CgogICAgICAgIDwhLS0gU2VjdGlvbiBoZWFkaW5nIC0tPgogICAgICAgIDxkaXYgaWQ9InNlY3Rpb24taGVhZGluZyI+PC9kaXY+CgogICAgICAgIDxkaXYgaWQ9InRhc2stbGlzdC1jb250YWluZXIiPjwvZGl2PgoKICAgICAgICA8IS0tID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQogICAgICAgICAgICAgQm90dG9tIHV0aWxpdHkgc2VjdGlvbjogSW1wb3J0L0V4cG9ydCwgU2hvcnRjdXRzCiAgICAgICAgICAgICA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0gLS0+CiAgICAgICAgPGRpdiBjbGFzcz0iZ3JpZCBncmlkLWNvbHMtMSBzbTpncmlkLWNvbHMtMiBnYXAtNCBwdC00IGJvcmRlci10IGJvcmRlci1ncmF5LTIwMCBkYXJrOmJvcmRlci1ncmF5LTgwMCI+CgogICAgICAgICAgPCEtLSBJbXBvcnQgLyBFeHBvcnQgLS0+CiAgICAgICAgICA8ZGl2IGNsYXNzPSJiZy13aGl0ZSBkYXJrOmJnLWdyYXktOTAwIGJvcmRlciBib3JkZXItZ3JheS0xMDAgZGFyazpib3JkZXItZ3JheS04MDAgcm91bmRlZC0yeGwgc2hhZG93LXNtIHAtNCBzbTpwLTUgc3BhY2UteS0zIj4KICAgICAgICAgICAgPGgzIGNsYXNzPSJ0ZXh0LXNtIGZvbnQtc2VtaWJvbGQgdGV4dC1ncmF5LTYwMCBkYXJrOnRleHQtZ3JheS0zMDAiPkltcG9ydCAmYW1wOyBFeHBvcnQ8L2gzPgogICAgICAgICAgICA8ZGl2IGlkPSJkcm9wem9uZSIgY2xhc3M9ImJvcmRlci0yIGJvcmRlci1kYXNoZWQgcm91bmRlZC14bCBwLTQgdGV4dC1jZW50ZXIgY3Vyc29yLXBvaW50ZXIgdHJhbnNpdGlvbi1jb2xvcnMgYm9yZGVyLWdyYXktMjAwIGRhcms6Ym9yZGVyLWdyYXktNzAwIGhvdmVyOmJvcmRlci1wcmltYXJ5LTQwMCI+CiAgICAgICAgICAgICAgPGlucHV0IGlkPSJmaWxlLWlucHV0IiB0eXBlPSJmaWxlIiBhY2NlcHQ9Ii54bHN4LC54bHMsLmNzdiwuZG9jeCIgY2xhc3M9ImhpZGRlbiIgLz4KICAgICAgICAgICAgICA8ZGl2IGNsYXNzPSJteC1hdXRvIG1iLTEgdGV4dC1ncmF5LTQwMCBmbGV4IGp1c3RpZnktY2VudGVyIj4ke0lDT05TLnVwbG9hZH08L2Rpdj4KICAgICAgICAgICAgICA8cCBjbGFzcz0iZm9udC1zZW1pYm9sZCB0ZXh0LXhzIHNtOnRleHQtc20iIGlkPSJkcm9wem9uZS10ZXh0Ij5EcmFnICZhbXA7IGRyb3AsIG9yIGNsaWNrIHRvIGJyb3dzZTwvcD4KICAgICAgICAgICAgICA8cCBjbGFzcz0idGV4dC14cyB0ZXh0LWdyYXktNDAwIG10LTEiPi54bHN4LCAueGxzLCAuY3N2LCAuZG9jeDwvcD4KICAgICAgICAgICAgPC9kaXY+CiAgICAgICAgICAgIDxkaXYgaWQ9ImltcG9ydC1tZXNzYWdlIj48L2Rpdj4KICAgICAgICAgICAgPGRpdiBjbGFzcz0iZ3JpZCBncmlkLWNvbHMtMiBnYXAtMiI+CiAgICAgICAgICAgICAgPGJ1dHRvbiBpZD0iZXhwb3J0LWV4Y2VsIiBjbGFzcz0iZmxleCBpdGVtcy1jZW50ZXIganVzdGlmeS1jZW50ZXIgZ2FwLTEuNSBweC0zIHB5LTIuNSByb3VuZGVkLXhsIGJnLWdyZWVuLTUwIGRhcms6YmctZ3JlZW4tOTUwLzMwIHRleHQtZ3JlZW4tNzAwIGRhcms6dGV4dC1ncmVlbi00MDAgZm9udC1zZW1pYm9sZCB0ZXh0LXhzIHNtOnRleHQtc20gaG92ZXI6YmctZ3JlZW4tMTAwIGRhcms6aG92ZXI6YmctZ3JlZW4tOTUwLzUwIHRyYW5zaXRpb24tY29sb3JzIj4KICAgICAgICAgICAgICAgICR7SUNPTlMuZXhjZWx9IEV4Y2VsCiAgICAgICAgICAgICAgPC9idXR0b24+CiAgICAgICAgICAgICAgPGJ1dHRvbiBpZD0iZXhwb3J0LXBkZiIgY2xhc3M9ImZsZXggaXRlbXMtY2VudGVyIGp1c3RpZnktY2VudGVyIGdhcC0xLjUgcHgtMyBweS0yLjUgcm91bmRlZC14bCBiZy1yZWQtNTAgZGFyazpiZy1yZWQtOTUwLzMwIHRleHQtcmVkLTcwMCBkYXJrOnRleHQtcmVkLTQwMCBmb250LXNlbWlib2xkIHRleHQteHMgc206dGV4dC1zbSBob3ZlcjpiZy1yZWQtMTAwIGRhcms6aG92ZXI6YmctcmVkLTk1MC81MCB0cmFuc2l0aW9uLWNvbG9ycyI+CiAgICAgICAgICAgICAgICAke0lDT05TLnBkZn0gUERGCiAgICAgICAgICAgICAgPC9idXR0b24+CiAgICAgICAgICAgIDwvZGl2PgogICAgICAgICAgICA8cCBjbGFzcz0idGV4dC14cyB0ZXh0LWdyYXktNDAwIj5DU1YgaXMgc3VwcG9ydGVkIG9uIGltcG9ydCAodXNlIEV4Y2VsIGV4cG9ydCBmb3IgQ1NWLWNvbXBhdGlibGUgb3V0cHV0KS48L3A+CiAgICAgICAgICA8L2Rpdj4KCiAgICAgICAgICA8IS0tIEtleWJvYXJkIFNob3J0Y3V0cyAtLT4KICAgICAgICAgIDxkaXYgY2xhc3M9ImJnLXdoaXRlIGRhcms6YmctZ3JheS05MDAgYm9yZGVyIGJvcmRlci1ncmF5LTEwMCBkYXJrOmJvcmRlci1ncmF5LTgwMCByb3VuZGVkLTJ4bCBzaGFkb3ctc20gcC00IHNtOnAtNSI+CiAgICAgICAgICAgIDxoMyBjbGFzcz0idGV4dC1zbSBmb250LXNlbWlib2xkIHRleHQtZ3JheS02MDAgZGFyazp0ZXh0LWdyYXktMzAwIG1iLTIiPktleWJvYXJkIFNob3J0Y3V0czwvaDM+CiAgICAgICAgICAgIDx1bCBjbGFzcz0idGV4dC1zbSB0ZXh0LWdyYXktNTAwIGRhcms6dGV4dC1ncmF5LTQwMCBzcGFjZS15LTEuNSI+CiAgICAgICAgICAgICAgPGxpPjxrYmQgY2xhc3M9InB4LTEuNSBweS0wLjUgcm91bmRlZCBiZy1ncmF5LTEwMCBkYXJrOmJnLWdyYXktODAwIGJvcmRlciBib3JkZXItZ3JheS0yMDAgZGFyazpib3JkZXItZ3JheS03MDAiPkN0cmwrTjwva2JkPiBOZXcgdGFzayAoZm9jdXMgcXVpY2sgYWRkKTwvbGk+CiAgICAgICAgICAgICAgPGxpPjxrYmQgY2xhc3M9InB4LTEuNSBweS0wLjUgcm91bmRlZCBiZy1ncmF5LTEwMCBkYXJrOmJnLWdyYXktODAwIGJvcmRlciBib3JkZXItZ3JheS0yMDAgZGFyazpib3JkZXItZ3JheS03MDAiPkN0cmwrVTwva2JkPiBUb2dnbGUgdXJnZW50IG9uIGxhc3QgdGFzazwvbGk+CiAgICAgICAgICAgICAgPGxpPjxrYmQgY2xhc3M9InB4LTEuNSBweS0wLjUgcm91bmRlZCBiZy1ncmF5LTEwMCBkYXJrOmJnLWdyYXktODAwIGJvcmRlciBib3JkZXItZ3JheS0yMDAgZGFyazpib3JkZXItZ3JheS03MDAiPi88L2tiZD4gRm9jdXMgc2VhcmNoPC9saT4KICAgICAgICAgICAgICA8bGk+PGtiZCBjbGFzcz0icHgtMS41IHB5LTAuNSByb3VuZGVkIGJnLWdyYXktMTAwIGRhcms6YmctZ3JheS04MDAgYm9yZGVyIGJvcmRlci1ncmF5LTIwMCBkYXJrOmJvcmRlci1ncmF5LTcwMCI+RW50ZXI8L2tiZD4gQWRkIHRhc2sgLyBzYXZlPC9saT4KICAgICAgICAgICAgICA8bGk+PGtiZCBjbGFzcz0icHgtMS41IHB5LTAuNSByb3VuZGVkIGJnLWdyYXktMTAwIGRhcms6YmctZ3JheS04MDAgYm9yZGVyIGJvcmRlci1ncmF5LTIwMCBkYXJrOmJvcmRlci1ncmF5LTcwMCI+RXNjPC9rYmQ+IENsb3NlIGRpYWxvZzwvbGk+CiAgICAgICAgICAgIDwvdWw+CiAgICAgICAgICA8L2Rpdj4KICAgICAgICA8L2Rpdj4KICAgICAgPC9tYWluPgoKICAgICAgPGRpdiBpZD0idGFzay1tb2RhbC1jb250YWluZXIiPjwvZGl2PgogICAgPC9kaXY+CiAgYDsKCiAgcmVuZGVyU3RhdHMoKTsKICByZW5kZXJTZWN0aW9uSGVhZGluZygpOwogIHJlbmRlclRhc2tMaXN0KCk7CiAgd2lyZURhc2hib2FyZEV2ZW50cygpOwp9Cjwvc2NyaXB0Pgo8c2NyaXB0PgovLyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KLy8gU3RhdHMgY2FyZHMKLy8gLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCmZ1bmN0aW9uIHJlbmRlclF1aWNrQWRkVXJnZW50TGFiZWwoKSB7CiAgY29uc3QgbGFiZWwgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgncXVpY2stYWRkLXVyZ2VudC1sYWJlbCcpOwogIGlmICghbGFiZWwpIHJldHVybjsKICBpZiAoc3RhdGUucXVpY2tBZGRVcmdlbnQpIHsKICAgIGxhYmVsLmNsYXNzTGlzdC5yZW1vdmUoJ2JnLWdyYXktMTAwJywgJ2Rhcms6YmctZ3JheS04MDAnLCAndGV4dC1ncmF5LTUwMCcsICdkYXJrOnRleHQtZ3JheS00MDAnLCAnaG92ZXI6YmctZ3JheS0yMDAnLCAnZGFyazpob3ZlcjpiZy1ncmF5LTcwMCcpOwogICAgbGFiZWwuY2xhc3NMaXN0LmFkZCgnYmctcmVkLTYwMCcsICd0ZXh0LXdoaXRlJywgJ3NoYWRvdy1tZCcsICdzaGFkb3ctcmVkLTYwMC8zMCcpOwogIH0gZWxzZSB7CiAgICBsYWJlbC5jbGFzc0xpc3QucmVtb3ZlKCdiZy1yZWQtNjAwJywgJ3RleHQtd2hpdGUnLCAnc2hhZG93LW1kJywgJ3NoYWRvdy1yZWQtNjAwLzMwJyk7CiAgICBsYWJlbC5jbGFzc0xpc3QuYWRkKCdiZy1ncmF5LTEwMCcsICdkYXJrOmJnLWdyYXktODAwJywgJ3RleHQtZ3JheS01MDAnLCAnZGFyazp0ZXh0LWdyYXktNDAwJywgJ2hvdmVyOmJnLWdyYXktMjAwJywgJ2Rhcms6aG92ZXI6YmctZ3JheS03MDAnKTsKICB9Cn0KCmZ1bmN0aW9uIHJlbmRlclN0YXRzKCkgewogIHJlbmRlclRvcE5hdlBhbmVscygpOwp9CgovLyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KLy8gVG9wIG5hdmlnYXRpb24gcGFuZWxzOiBBbGwgVGFza3MgLyBVcmdlbnQgLyBPdmVyZHVlIC8gQXJjaGl2ZQovLyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KY29uc3QgVklFV19QQU5FTFMgPSBbCiAgeyBrZXk6ICdhbGwnLCBsYWJlbDogJ0FsbCBUYXNrcycsIGljb246IElDT05TLmxpc3QsIGFjdGl2ZUNvbG9yOiAnYmctcHJpbWFyeS02MDAgdGV4dC13aGl0ZSBzaGFkb3ctbGcgc2hhZG93LXByaW1hcnktNjAwLzMwJyB9LAogIHsga2V5OiAnam9zaHVhJywgbGFiZWw6ICdKb3NodWEnLCBpY29uOiBJQ09OUy5saXN0LCBhY3RpdmVDb2xvcjogJ2JnLXB1cnBsZS02MDAgdGV4dC13aGl0ZSBzaGFkb3ctbGcgc2hhZG93LXB1cnBsZS02MDAvMzAnIH0sCiAgeyBrZXk6ICd1cmdlbnQnLCBsYWJlbDogJ1VyZ2VudCcsIGljb246IElDT05TLmFsZXJ0LCBhY3RpdmVDb2xvcjogJ2JnLXJlZC02MDAgdGV4dC13aGl0ZSBzaGFkb3ctbGcgc2hhZG93LXJlZC02MDAvMzAnIH0sCiAgeyBrZXk6ICdvdmVyZHVlJywgbGFiZWw6ICdPdmVyZHVlJywgaWNvbjogSUNPTlMuY2xvY2ssIGFjdGl2ZUNvbG9yOiAnYmctcmVkLTYwMCB0ZXh0LXdoaXRlIHNoYWRvdy1sZyBzaGFkb3ctcmVkLTYwMC8zMCcgfSwKICB7IGtleTogJ2FyY2hpdmUnLCBsYWJlbDogJ0FyY2hpdmUnLCBpY29uOiBJQ09OUy5iYWNrdXAsIGFjdGl2ZUNvbG9yOiAnYmctZ3JheS03MDAgdGV4dC13aGl0ZSBzaGFkb3ctbGcgc2hhZG93LWdyYXktNzAwLzMwIGRhcms6YmctZ3JheS02MDAnIH0sCl07CgpmdW5jdGlvbiByZW5kZXJUb3BOYXZQYW5lbHMoKSB7CiAgY29uc3QgY29udGFpbmVyID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3RvcC1uYXYtcGFuZWxzJyk7CiAgaWYgKCFjb250YWluZXIpIHJldHVybjsKICBjb25zdCBzdGF0cyA9IGNvbXB1dGVTdGF0cygpOwogIGNvbnN0IGNvdW50cyA9IHsgYWxsOiBzdGF0cy5hY3RpdmVDb3VudCwgam9zaHVhOiBzdGF0cy5qb3NodWEsIHVyZ2VudDogc3RhdHMudXJnZW50LCBvdmVyZHVlOiBzdGF0cy5vdmVyZHVlLCBhcmNoaXZlOiBzdGF0cy5hcmNoaXZlZENvdW50IH07CgogIGNvbnRhaW5lci5pbm5lckhUTUwgPSBWSUVXX1BBTkVMUy5tYXAoKHApID0+IHsKICAgIGNvbnN0IGlzQWN0aXZlID0gc3RhdGUudmlldyA9PT0gcC5rZXk7CiAgICByZXR1cm4gYAogICAgICA8YnV0dG9uIGRhdGEtdmlldz0iJHtwLmtleX0iIGNsYXNzPSJuYXYtcGFuZWwtYnRuIGZsZXggaXRlbXMtY2VudGVyIGp1c3RpZnktY2VudGVyIGdhcC0xLjUgc206Z2FwLTIgcHgtMiBzbTpweC00IHB5LTEuNSBzbTpweS0yIHJvdW5kZWQteGwgdGV4dC14cyBzbTp0ZXh0LXNtIGZvbnQtYm9sZCB0cmFuc2l0aW9uLWFsbCAkewogICAgICAgIGlzQWN0aXZlID8gcC5hY3RpdmVDb2xvciA6ICdiZy1ncmF5LTEwMCBkYXJrOmJnLWdyYXktODAwIHRleHQtZ3JheS02MDAgZGFyazp0ZXh0LWdyYXktMzAwIGhvdmVyOmJnLWdyYXktMjAwIGRhcms6aG92ZXI6YmctZ3JheS03MDAnCiAgICAgIH0iPgogICAgICAgICR7cC5pY29uLnJlcGxhY2UoJ2ljb24nLCAnaWNvbi1zbScpfQogICAgICAgIDxzcGFuIGNsYXNzPSJ0cnVuY2F0ZSI+JHtwLmxhYmVsfTwvc3Bhbj4KICAgICAgICA8c3BhbiBjbGFzcz0iaW5saW5lLWZsZXggaXRlbXMtY2VudGVyIGp1c3RpZnktY2VudGVyIG1pbi13LVsxLjI1cmVtXSBoLTUgcHgtMSByb3VuZGVkLWZ1bGwgdGV4dC14cyBmb250LWV4dHJhYm9sZCAkewogICAgICAgICAgaXNBY3RpdmUgPyAnYmctd2hpdGUvMjUgdGV4dC13aGl0ZScgOiAnYmctd2hpdGUgZGFyazpiZy1ncmF5LTkwMCB0ZXh0LWdyYXktNTAwIGRhcms6dGV4dC1ncmF5LTQwMCcKICAgICAgICB9Ij4ke2NvdW50c1twLmtleV19PC9zcGFuPgogICAgICA8L2J1dHRvbj4KICAgIGA7CiAgfSkuam9pbignJyk7CgogIGNvbnRhaW5lci5xdWVyeVNlbGVjdG9yQWxsKCcubmF2LXBhbmVsLWJ0bicpLmZvckVhY2goKGJ0bikgPT4gewogICAgYnRuLmFkZEV2ZW50TGlzdGVuZXIoJ2NsaWNrJywgKCkgPT4gewogICAgICBzdGF0ZS52aWV3ID0gYnRuLmRhdGFzZXQudmlldzsKICAgICAgc3RhdGUuc2VhcmNoID0gJyc7CiAgICAgIHJlbmRlclRvcE5hdlBhbmVscygpOwogICAgICByZW5kZXJTZWN0aW9uSGVhZGluZygpOwogICAgICByZW5kZXJUYXNrTGlzdCgpOwogICAgICBjb25zdCBzZWFyY2hJbnB1dCA9IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdzZWFyY2gtaW5wdXQnKTsKICAgICAgaWYgKHNlYXJjaElucHV0KSBzZWFyY2hJbnB1dC52YWx1ZSA9ICcnOwogICAgICBjb25zdCBjbGVhckJ0biA9IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdzZWFyY2gtY2xlYXInKTsKICAgICAgaWYgKGNsZWFyQnRuKSBjbGVhckJ0bi5jbGFzc0xpc3QuYWRkKCdoaWRkZW4nKTsKICAgIH0pOwogIH0pOwp9CgovLyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KLy8gU2VjdGlvbiBoZWFkaW5nIChzaG93biBhYm92ZSB0aGUgdGFzayBsaXN0LCBkZXNjcmliZXMgY3VycmVudCBwYW5lbCkKLy8gLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCmNvbnN0IFNFQ1RJT05fSU5GTyA9IHsKICBhbGw6IHsgdGl0bGU6ICdBbGwgVGFza3MnLCBkZXNjOiAnQWxsIHBlbmRpbmcgYW5kIGluLXByb2dyZXNzIHRhc2tzLiBVcmdlbnQgb25lcyBhcmUgaGlnaGxpZ2h0ZWQgYW5kIHNob3duIGZpcnN0LicgfSwKICBqb3NodWE6IHsgdGl0bGU6ICdKb3NodWEnLCBkZXNjOiAnVGFza3MgcmVsYXRlZCB0byBKb3NodWEuJyB9LAogIHVyZ2VudDogeyB0aXRsZTogJ1VyZ2VudCBUYXNrcycsIGRlc2M6ICdUYXNrcyBtYXJrZWQgdXJnZW50LiBUaGV5IHN0YXkgaGVyZSB1bnRpbCB1cmdlbmN5IGlzIHJlbW92ZWQgb3IgdGhlIHRhc2sgaXMgYXJjaGl2ZWQuJyB9LAogIG92ZXJkdWU6IHsgdGl0bGU6ICdPdmVyZHVlIFRhc2tzJywgZGVzYzogJ1Rhc2tzIHdob3NlIGR1ZSBkYXRlIGhhcyBwYXNzZWQgYW5kIGFyZSBub3QgeWV0IGNvbXBsZXRlZCwgbW9zdCBvdmVyZHVlIGZpcnN0LicgfSwKICBhcmNoaXZlOiB7IHRpdGxlOiAnQXJjaGl2ZScsIGRlc2M6IGBDb21wbGV0ZWQgLyBhcmNoaXZlZCB0YXNrcy4gQXV0by1kZWxldGVkICR7QVJDSElWRV9SRVRFTlRJT05fREFZU30gZGF5cyBhZnRlciBhcmNoaXZpbmcuYCB9LAp9OwoKZnVuY3Rpb24gcmVuZGVyU2VjdGlvbkhlYWRpbmcoKSB7CiAgY29uc3QgY29udGFpbmVyID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3NlY3Rpb24taGVhZGluZycpOwogIGlmICghY29udGFpbmVyKSByZXR1cm47CiAgY29uc3QgaW5mbyA9IFNFQ1RJT05fSU5GT1tzdGF0ZS52aWV3XSB8fCBTRUNUSU9OX0lORk8uYWxsOwogIGNvbnRhaW5lci5pbm5lckhUTUwgPSBgCiAgICA8ZGl2PgogICAgICA8aDIgY2xhc3M9InRleHQteGwgc206dGV4dC0yeGwgZm9udC1leHRyYWJvbGQiPiR7aW5mby50aXRsZX08L2gyPgogICAgICA8cCBjbGFzcz0idGV4dC1zbSB0ZXh0LWdyYXktNTAwIGRhcms6dGV4dC1ncmF5LTQwMCBtdC0wLjUiPiR7aW5mby5kZXNjfTwvcD4KICAgIDwvZGl2PgogIGA7Cn0KCi8vIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQovLyBUYXNrIGxpc3QgJiBjYXJkcwovLyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KY29uc3QgU1RBVFVTX0NPTkZJRyA9IHsKICBwZW5kaW5nOiB7IGxhYmVsOiAnUGVuZGluZycsIGljb246IElDT05TLmNsb2NrLCBjbGFzc05hbWU6ICdiZy1ncmF5LTEwMCB0ZXh0LWdyYXktNjAwIGRhcms6YmctZ3JheS04MDAgZGFyazp0ZXh0LWdyYXktMzAwJyB9LAogIGluX3Byb2dyZXNzOiB7IGxhYmVsOiAnSW4gUHJvZ3Jlc3MnLCBpY29uOiBJQ09OUy5sb2FkZXIsIGNsYXNzTmFtZTogJ2JnLWJsdWUtNTAgdGV4dC1ibHVlLTYwMCBkYXJrOmJnLWJsdWUtOTUwLzQwIGRhcms6dGV4dC1ibHVlLTQwMCcgfSwKICBjb21wbGV0ZWQ6IHsgbGFiZWw6ICdDb21wbGV0ZWQnLCBpY29uOiBJQ09OUy5jaGVjaywgY2xhc3NOYW1lOiAnYmctZ3JlZW4tNTAgdGV4dC1ncmVlbi02MDAgZGFyazpiZy1ncmVlbi05NTAvNDAgZGFyazp0ZXh0LWdyZWVuLTQwMCcgfSwKfTsKCmZ1bmN0aW9uIHRhc2tDYXJkSHRtbCh0YXNrKSB7CiAgY29uc3Qgc3RhdHVzSW5mbyA9IFNUQVRVU19DT05GSUdbdGFzay5zdGF0dXNdIHx8IFNUQVRVU19DT05GSUcucGVuZGluZzsKICBjb25zdCBpc0NvbXBsZXRlZCA9IHRhc2suc3RhdHVzID09PSAnY29tcGxldGVkJzsKICBjb25zdCBpc0FyY2hpdmVkID0gISF0YXNrLmFyY2hpdmVkQXQ7CiAgY29uc3Qgb3ZlcmR1ZSA9IGlzT3ZlcmR1ZSh0YXNrKTsKICBjb25zdCBkdWVUb2RheSA9IGlzRHVlVG9kYXkodGFzayk7CiAgY29uc3QgcHVyZ2VEYXlzID0gaXNBcmNoaXZlZCA/IGRheXNVbnRpbFB1cmdlKHRhc2spIDogbnVsbDsKCiAgY29uc3QgY29tcGxldGVCdG4gPSBpc0FyY2hpdmVkID8gYAogICAgICAgIDxidXR0b24gZGF0YS1hY3Rpb249InJlc3RvcmUiIGRhdGEtaWQ9IiR7dGFzay5pZH0iIHRpdGxlPSJSZXN0b3JlIHRvIFBlbmRpbmciCiAgICAgICAgICBjbGFzcz0iZmxleCBpdGVtcy1jZW50ZXIganVzdGlmeS1jZW50ZXIgZ2FwLTEgcHgtMi41IHNtOnB4LTMgaC04IHJvdW5kZWQtbGcgdGV4dC14cyBzbTp0ZXh0LXNtIGZvbnQtc2VtaWJvbGQgdHJhbnNpdGlvbi1jb2xvcnMgYmctcHJpbWFyeS01MCB0ZXh0LXByaW1hcnktNzAwIGRhcms6YmctcHJpbWFyeS05NTAvMzAgZGFyazp0ZXh0LXByaW1hcnktNDAwIGhvdmVyOmJnLXByaW1hcnktMTAwIGRhcms6aG92ZXI6YmctcHJpbWFyeS05NTAvNTAiPgogICAgICAgICAgJHtJQ09OUy51cGxvYWQucmVwbGFjZSgnaWNvbicsJ2ljb24tc20nKX0gPHNwYW4gY2xhc3M9ImhpZGRlbiBzbTppbmxpbmUiPlJlc3RvcmU8L3NwYW4+CiAgICAgICAgPC9idXR0b24+YCA6IGAKICAgICAgICA8YnV0dG9uIGRhdGEtYWN0aW9uPSJ0b2dnbGUtY29tcGxldGUiIGRhdGEtaWQ9IiR7dGFzay5pZH0iIHRpdGxlPSJNYXJrIGFzIGNvbXBsZXRlIChtb3ZlcyB0byBBcmNoaXZlKSIKICAgICAgICAgIGNsYXNzPSJmbGV4IGl0ZW1zLWNlbnRlciBqdXN0aWZ5LWNlbnRlciBnYXAtMSBweC0yLjUgc206cHgtMyBoLTggcm91bmRlZC1sZyB0ZXh0LXhzIHNtOnRleHQtc20gZm9udC1zZW1pYm9sZCB0cmFuc2l0aW9uLWNvbG9ycyBiZy1ncmVlbi01MCB0ZXh0LWdyZWVuLTcwMCBkYXJrOmJnLWdyZWVuLTk1MC8zMCBkYXJrOnRleHQtZ3JlZW4tNDAwIGhvdmVyOmJnLWdyZWVuLTEwMCBkYXJrOmhvdmVyOmJnLWdyZWVuLTk1MC81MCI+CiAgICAgICAgICAke0lDT05TLmNoZWNrLnJlcGxhY2UoJ2ljb24nLCdpY29uLXNtJyl9IDxzcGFuIGNsYXNzPSJoaWRkZW4gc206aW5saW5lIj5Db21wbGV0ZTwvc3Bhbj4KICAgICAgICA8L2J1dHRvbj5gOwoKICByZXR1cm4gYAogICAgPGRpdiBjbGFzcz0iZ3JvdXAgcmVsYXRpdmUgYmctd2hpdGUgZGFyazpiZy1ncmF5LTkwMCBib3JkZXIgcm91bmRlZC14bCBzaGFkb3ctc20gcHgtMyBweS0yLjUgc206cHgtNCBzbTpweS0zIGZsZXggaXRlbXMtY2VudGVyIGZsZXgtd3JhcCBnYXAtMi41IHNtOmdhcC0zIHRyYW5zaXRpb24tYWxsIGFuaW0tZmFkZSAkewogICAgICAodGFzay5pc1VyZ2VudCB8fCBvdmVyZHVlKSAmJiAhaXNBcmNoaXZlZAogICAgICAgID8gJ2JvcmRlci1yZWQtMzAwIGRhcms6Ym9yZGVyLXJlZC04MDAgcmluZy0xIHJpbmctcmVkLTEwMCBkYXJrOnJpbmctcmVkLTkwMC80MCBiZy1yZWQtNTAvNDAgZGFyazpiZy1yZWQtOTUwLzEwJwogICAgICAgIDogZHVlVG9kYXkgJiYgIWlzQXJjaGl2ZWQKICAgICAgICAgID8gJ2JvcmRlci1vcmFuZ2UtMzAwIGRhcms6Ym9yZGVyLW9yYW5nZS04MDAgcmluZy0xIHJpbmctb3JhbmdlLTEwMCBkYXJrOnJpbmctb3JhbmdlLTkwMC80MCBiZy1vcmFuZ2UtNTAvNDAgZGFyazpiZy1vcmFuZ2UtOTUwLzEwJwogICAgICAgICAgOiAnYm9yZGVyLWdyYXktMTAwIGRhcms6Ym9yZGVyLWdyYXktODAwJwogICAgfSI+CiAgICAgICR7IWlzQXJjaGl2ZWQgPyBgCiAgICAgIDxidXR0b24gZGF0YS1hY3Rpb249InRvZ2dsZS1jb21wbGV0ZSIgZGF0YS1pZD0iJHt0YXNrLmlkfSIgdGl0bGU9Ik1hcmsgYXMgY29tcGxldGUiCiAgICAgICAgY2xhc3M9ImZsZXgtc2hyaW5rLTAgdy02IGgtNiByb3VuZGVkLWZ1bGwgYm9yZGVyLTIgZmxleCBpdGVtcy1jZW50ZXIganVzdGlmeS1jZW50ZXIgdHJhbnNpdGlvbi1jb2xvcnMgYm9yZGVyLWdyYXktMzAwIGRhcms6Ym9yZGVyLWdyYXktNjAwIGhvdmVyOmJvcmRlci1wcmltYXJ5LTUwMCBob3ZlcjpiZy1wcmltYXJ5LTUwIGRhcms6aG92ZXI6YmctcHJpbWFyeS05NTAvMzAiPgogICAgICA8L2J1dHRvbj5gIDogYAogICAgICA8ZGl2IGNsYXNzPSJmbGV4LXNocmluay0wIHctNiBoLTYgcm91bmRlZC1mdWxsIGJnLWdyZWVuLTUwMCB0ZXh0LXdoaXRlIGZsZXggaXRlbXMtY2VudGVyIGp1c3RpZnktY2VudGVyIj4KICAgICAgICAke0lDT05TLmNoZWNrLnJlcGxhY2UoJ2ljb24nLCAnaWNvbi1zbScpfQogICAgICA8L2Rpdj5gfQoKICAgICAgPGRpdiBjbGFzcz0iZmxleC0xIG1pbi13LTAgY3Vyc29yLXBvaW50ZXIiIGRhdGEtYWN0aW9uPSJlZGl0IiBkYXRhLWlkPSIke3Rhc2suaWR9Ij4KICAgICAgICA8ZGl2IGNsYXNzPSJmbGV4IGl0ZW1zLWNlbnRlciBmbGV4LXdyYXAgZ2FwLTEuNSBtYi0wLjUiPgogICAgICAgICAgJHt0YXNrLmNhdGVnb3J5PT09J2pvc2h1YScgPyAnPHNwYW4gY2xhc3M9ImlubGluZS1mbGV4IGl0ZW1zLWNlbnRlciBnYXAtMSBweC0yIHB5LTAuNSByb3VuZGVkLWZ1bGwgdGV4dC14cyBmb250LWJvbGQgYmctcHVycGxlLTYwMCB0ZXh0LXdoaXRlIj5Kb3NodWE8L3NwYW4+JyA6ICcnfQogICAgICAgICAgJHt0YXNrLmlzVXJnZW50ID8gYDxzcGFuIGNsYXNzPSJpbmxpbmUtZmxleCBpdGVtcy1jZW50ZXIgZ2FwLTEgcHgtMiBweS0wLjUgcm91bmRlZC1mdWxsIHRleHQteHMgZm9udC1ib2xkIGJnLXJlZC02MDAgdGV4dC13aGl0ZSI+JHtJQ09OUy5hbGVydC5yZXBsYWNlKCdpY29uJywnaWNvbi1zbScpfSBVcmdlbnQ8L3NwYW4+YCA6ICcnfQogICAgICAgICAgJHt0YXNrLnN0YXR1cyAhPT0gJ3BlbmRpbmcnID8gYDxzcGFuIGNsYXNzPSJpbmxpbmUtZmxleCBpdGVtcy1jZW50ZXIgZ2FwLTEgcHgtMiBweS0wLjUgcm91bmRlZC1mdWxsIHRleHQteHMgZm9udC1zZW1pYm9sZCAke3N0YXR1c0luZm8uY2xhc3NOYW1lfSI+JHtzdGF0dXNJbmZvLmljb24ucmVwbGFjZSgnaWNvbicsJ2ljb24tc20nKX0gJHtzdGF0dXNJbmZvLmxhYmVsfTwvc3Bhbj5gIDogJyd9CiAgICAgICAgICAke292ZXJkdWUgPyBgPHNwYW4gY2xhc3M9ImlubGluZS1mbGV4IGl0ZW1zLWNlbnRlciBnYXAtMSBweC0yIHB5LTAuNSByb3VuZGVkLWZ1bGwgdGV4dC14cyBmb250LWJvbGQgYmctcmVkLTYwMCB0ZXh0LXdoaXRlIj4ke0lDT05TLmNsb2NrLnJlcGxhY2UoJ2ljb24nLCdpY29uLXNtJyl9IE92ZXJkdWU8L3NwYW4+YCA6ICcnfQogICAgICAgICAgJHtkdWVUb2RheSA/IGA8c3BhbiBjbGFzcz0iaW5saW5lLWZsZXggaXRlbXMtY2VudGVyIGdhcC0xIHB4LTIgcHktMC41IHJvdW5kZWQtZnVsbCB0ZXh0LXhzIGZvbnQtYm9sZCBiZy1vcmFuZ2UtNTAwIHRleHQtd2hpdGUiPiR7SUNPTlMuY2xvY2sucmVwbGFjZSgnaWNvbicsJ2ljb24tc20nKX0gRHVlIFRvZGF5PC9zcGFuPmAgOiAnJ30KICAgICAgICA8L2Rpdj4KCiAgICAgICAgPGgzIGNsYXNzPSJ0ZXh0LXNtIHNtOnRleHQtYmFzZSBmb250LWJvbGQgbGVhZGluZy1zbnVnIGJyZWFrLXdvcmRzIHdoaXRlc3BhY2Utbm9ybWFsICR7aXNDb21wbGV0ZWQgPyAnbGluZS10aHJvdWdoIHRleHQtZ3JheS00MDAnIDogJyd9Ij4ke2VzY2FwZUh0bWwodGFzay50YXNrTmFtZSl9PC9oMz4KCiAgICAgICAgJHt0YXNrLmRlc2NyaXB0aW9uID8gYDxwIGNsYXNzPSJ0ZXh0LXhzIHNtOnRleHQtc20gdGV4dC1ncmF5LTYwMCBkYXJrOnRleHQtZ3JheS0zMDAgbXQtMC41IGJyZWFrLXdvcmRzIHdoaXRlc3BhY2UtcHJlLXdyYXAgJHtpc0NvbXBsZXRlZCA/ICdsaW5lLXRocm91Z2ggb3BhY2l0eS03MCcgOiAnJ30iPiR7ZXNjYXBlSHRtbCh0YXNrLmRlc2NyaXB0aW9uKX08L3A+YCA6ICcnfQoKICAgICAgICA8ZGl2IGNsYXNzPSJmbGV4IGl0ZW1zLWNlbnRlciBmbGV4LXdyYXAgZ2FwLXgtMi41IGdhcC15LTEgbXQtMSB0ZXh0LXhzIHRleHQtZ3JheS00MDAiPgogICAgICAgICAgJHt0YXNrLmR1ZURhdGUgPyBgCiAgICAgICAgICAgIDxzcGFuIGNsYXNzPSJpbmxpbmUtZmxleCBpdGVtcy1jZW50ZXIgZ2FwLTEgcHgtMiBweS0wLjUgcm91bmRlZC1mdWxsIGZvbnQtc2VtaWJvbGQgJHsKICAgICAgICAgICAgICBvdmVyZHVlCiAgICAgICAgICAgICAgICA/ICdiZy1yZWQtNjAwIHRleHQtd2hpdGUnCiAgICAgICAgICAgICAgICA6ICdiZy1yZWQtMTAwIHRleHQtcmVkLTcwMCBkYXJrOmJnLXJlZC05NTAvNTAgZGFyazp0ZXh0LXJlZC00MDAnCiAgICAgICAgICAgIH0iPiR7SUNPTlMuY2xvY2sucmVwbGFjZSgnaWNvbicsJ2ljb24tc20nKX0gRHVlICR7Zm9ybWF0RGF0ZSh0YXNrLmR1ZURhdGUgKyAnVDAwOjAwOjAwJyl9PC9zcGFuPgogICAgICAgICAgYCA6ICcnfQogICAgICAgICAgPHNwYW4+Q3JlYXRlZCAke2Zvcm1hdERhdGUodGFzay5jcmVhdGVkQXQpfTwvc3Bhbj4KICAgICAgICAgICR7aXNBcmNoaXZlZCA/IGA8c3BhbiBjbGFzcz0idGV4dC1ncmF5LTQwMCI+Jm1pZGRvdDsgQXJjaGl2ZWQgJHtmb3JtYXREYXRlKHRhc2suYXJjaGl2ZWRBdCl9PC9zcGFuPmAgOiAnJ30KICAgICAgICAgICR7aXNBcmNoaXZlZCAmJiBwdXJnZURheXMgIT09IG51bGwgPyBgPHNwYW4gY2xhc3M9InRleHQtYW1iZXItNTAwIGRhcms6dGV4dC1hbWJlci00MDAgZm9udC1tZWRpdW0iPiZtaWRkb3Q7IEF1dG8tZGVsZXRlcyBpbiAke3B1cmdlRGF5c30gZGF5JHtwdXJnZURheXMgPT09IDEgPyAnJyA6ICdzJ308L3NwYW4+YCA6ICcnfQogICAgICAgIDwvZGl2PgogICAgICA8L2Rpdj4KCiAgICAgIDxkaXYgY2xhc3M9ImZsZXggaXRlbXMtY2VudGVyIGdhcC0xLjUgc206Z2FwLTIgZmxleC1zaHJpbmstMCBtbC1hdXRvIG10LTIgc206bXQtMCI+CiAgICAgICAgJHtjb21wbGV0ZUJ0bn0KICAgICAgICA8YnV0dG9uIGRhdGEtYWN0aW9uPSJ0b2dnbGUtdXJnZW50IiBkYXRhLWlkPSIke3Rhc2suaWR9IiB0aXRsZT0iJHt0YXNrLmlzVXJnZW50ID8gJ1JlbW92ZSB1cmdlbnQgZmxhZycgOiAnTWFyayB1cmdlbnQnfSIKICAgICAgICAgIGNsYXNzPSJ3LTggaC04IGZsZXggaXRlbXMtY2VudGVyIGp1c3RpZnktY2VudGVyIHJvdW5kZWQtbGcgdHJhbnNpdGlvbi1jb2xvcnMgJHsKICAgICAgICAgICAgdGFzay5pc1VyZ2VudCA/ICdiZy1yZWQtMTAwIHRleHQtcmVkLTYwMCBkYXJrOmJnLXJlZC05NTAvNTAgZGFyazp0ZXh0LXJlZC00MDAnIDogJ2JnLWdyYXktMTAwIGRhcms6YmctZ3JheS04MDAgdGV4dC1ncmF5LTQwMCBob3Zlcjp0ZXh0LXJlZC01MDAnCiAgICAgICAgICB9Ij4ke0lDT05TLmFsZXJ0LnJlcGxhY2UoJ2ljb24nLCdpY29uLXNtJyl9PC9idXR0b24+CiAgICAgICAgPGJ1dHRvbiBkYXRhLWFjdGlvbj0iZWRpdCIgZGF0YS1pZD0iJHt0YXNrLmlkfSIgdGl0bGU9IkVkaXQgdGFzayIKICAgICAgICAgIGNsYXNzPSJ3LTggaC04IGZsZXggaXRlbXMtY2VudGVyIGp1c3RpZnktY2VudGVyIHJvdW5kZWQtbGcgYmctZ3JheS0xMDAgZGFyazpiZy1ncmF5LTgwMCB0ZXh0LWdyYXktNTAwIGhvdmVyOnRleHQtcHJpbWFyeS02MDAgdHJhbnNpdGlvbi1jb2xvcnMiPiR7SUNPTlMucGVuY2lsLnJlcGxhY2UoJ2ljb24nLCdpY29uLXNtJyl9PC9idXR0b24+CiAgICAgICAgJHshaXNBcmNoaXZlZCA/IGA8YnV0dG9uIGRhdGEtYWN0aW9uPSJhcmNoaXZlIiBkYXRhLWlkPSIke3Rhc2suaWR9IiB0aXRsZT0iQXJjaGl2ZSB0YXNrIgogICAgICAgICAgY2xhc3M9InctOCBoLTggZmxleCBpdGVtcy1jZW50ZXIganVzdGlmeS1jZW50ZXIgcm91bmRlZC1sZyBiZy1ncmF5LTEwMCBkYXJrOmJnLWdyYXktODAwIHRleHQtZ3JheS01MDAgaG92ZXI6dGV4dC1hbWJlci02MDAgdHJhbnNpdGlvbi1jb2xvcnMiPiR7SUNPTlMuYmFja3VwLnJlcGxhY2UoJ2ljb24nLCdpY29uLXNtJyl9PC9idXR0b24+YCA6ICcnfQogICAgICAgIDxidXR0b24gZGF0YS1hY3Rpb249ImRlbGV0ZSIgZGF0YS1pZD0iJHt0YXNrLmlkfSIgdGl0bGU9IkRlbGV0ZSB0YXNrIgogICAgICAgICAgY2xhc3M9InctOCBoLTggZmxleCBpdGVtcy1jZW50ZXIganVzdGlmeS1jZW50ZXIgcm91bmRlZC1sZyBiZy1ncmF5LTEwMCBkYXJrOmJnLWdyYXktODAwIHRleHQtZ3JheS01MDAgaG92ZXI6dGV4dC1yZWQtNjAwIHRyYW5zaXRpb24tY29sb3JzIj4ke0lDT05TLnRyYXNoLnJlcGxhY2UoJ2ljb24nLCdpY29uLXNtJyl9PC9idXR0b24+CiAgICAgIDwvZGl2PgogICAgPC9kaXY+CiAgYDsKfQoKZnVuY3Rpb24gcmVuZGVyVGFza0xpc3QoKSB7CiAgY29uc3QgY29udGFpbmVyID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3Rhc2stbGlzdC1jb250YWluZXInKTsKICBjb25zdCB0YXNrcyA9IGdldEZpbHRlcmVkU29ydGVkVGFza3MoKTsKCiAgaWYgKHRhc2tzLmxlbmd0aCA9PT0gMCkgewogICAgY29uc3QgZW1wdHlNZXNzYWdlcyA9IHsKICAgICAgYWxsOiB7IHRpdGxlOiAnTm8gdGFza3MgeWV0JywgZGVzYzogJ0FkZCBhIHRhc2sgYWJvdmUgdG8gZ2V0IHN0YXJ0ZWQuJyB9LAogICAgICBqb3NodWE6IHsgdGl0bGU6ICdObyBKb3NodWEgdGFza3MnLCBkZXNjOiAnVGFza3MgY2F0ZWdvcmlzZWQgYXMgSm9zaHVhIHdpbGwgc2hvdyBoZXJlLicgfSwKICAgICAgdXJnZW50OiB7IHRpdGxlOiAnTm8gdXJnZW50IHRhc2tzJywgZGVzYzogJ01hcmsgYSB0YXNrIHVyZ2VudCBhbmQgaXQgd2lsbCBzaG93IHVwIGhlcmUuJyB9LAogICAgICBvdmVyZHVlOiB7IHRpdGxlOiAnTm90aGluZyBvdmVyZHVlJywgZGVzYzogJ1Rhc2tzIHBhc3QgdGhlaXIgZHVlIGRhdGUgd2lsbCBzaG93IHVwIGhlcmUuJyB9LAogICAgICBhcmNoaXZlOiB7IHRpdGxlOiAnQXJjaGl2ZSBpcyBlbXB0eScsIGRlc2M6ICdDb21wbGV0ZWQgdGFza3Mgd2lsbCBhcHBlYXIgaGVyZSwgdGhlbiBhdXRvLWRlbGV0ZSBhZnRlciAzMCBkYXlzLicgfSwKICAgIH07CiAgICBjb25zdCBtc2cgPSBlbXB0eU1lc3NhZ2VzW3N0YXRlLnZpZXddIHx8IGVtcHR5TWVzc2FnZXMuYWxsOwogICAgY29udGFpbmVyLmlubmVySFRNTCA9IGAKICAgICAgPGRpdiBjbGFzcz0iZmxleCBmbGV4LWNvbCBpdGVtcy1jZW50ZXIganVzdGlmeS1jZW50ZXIgcHktMTYgdGV4dC1jZW50ZXIgdGV4dC1ncmF5LTQwMCBiZy13aGl0ZSBkYXJrOmJnLWdyYXktOTAwIGJvcmRlciBib3JkZXItZGFzaGVkIGJvcmRlci1ncmF5LTIwMCBkYXJrOmJvcmRlci1ncmF5LTgwMCByb3VuZGVkLTJ4bCI+CiAgICAgICAgPGRpdiBjbGFzcz0ibWItMyBvcGFjaXR5LTUwIiBzdHlsZT0id2lkdGg6NDhweDtoZWlnaHQ6NDhweCI+JHtJQ09OUy5saXN0fTwvZGl2PgogICAgICAgIDxwIGNsYXNzPSJ0ZXh0LWxnIGZvbnQtc2VtaWJvbGQiPiR7bXNnLnRpdGxlfTwvcD4KICAgICAgICA8cCBjbGFzcz0idGV4dC1zbSBtdC0xIj4ke21zZy5kZXNjfTwvcD4KICAgICAgPC9kaXY+CiAgICBgOwogICAgcmV0dXJuOwogIH0KCiAgY29udGFpbmVyLmlubmVySFRNTCA9IGA8ZGl2IGNsYXNzPSJzcGFjZS15LTIiPiR7dGFza3MubWFwKHRhc2tDYXJkSHRtbCkuam9pbignJyl9PC9kaXY+YDsKfQo8L3NjcmlwdD4KPHNjcmlwdD4KLy8gLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCi8vIFRhc2sgZWRpdCBtb2RhbCAod2l0aCBhdXRvLXNhdmUsIG5vdGVzLCBjb21tZW50cykKLy8gLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCmNvbnN0IFNUQVRVU19PUFRJT05TID0gWwogIHsgdmFsdWU6ICdwZW5kaW5nJywgbGFiZWw6ICdQZW5kaW5nJyB9LAogIHsgdmFsdWU6ICdpbl9wcm9ncmVzcycsIGxhYmVsOiAnSW4gUHJvZ3Jlc3MnIH0sCiAgeyB2YWx1ZTogJ2NvbXBsZXRlZCcsIGxhYmVsOiAnQ29tcGxldGVkJyB9LApdOwoKZnVuY3Rpb24gc2V0U2F2ZUluZGljYXRvcihzdGF0ZU5hbWUpIHsKICBjb25zdCBlbCA9IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdzYXZlLWluZGljYXRvcicpOwogIGlmICghZWwpIHJldHVybjsKICBpZiAoc3RhdGVOYW1lID09PSAnc2F2aW5nJykgewogICAgZWwuaW5uZXJIVE1MID0gYDxzcGFuIGNsYXNzPSJmbGV4IGl0ZW1zLWNlbnRlciBnYXAtMS41Ij4ke0lDT05TLmxvYWRlci5yZXBsYWNlKCdpY29uJywnaWNvbi1zbScpfSBTYXZpbmfigKY8L3NwYW4+YDsKICB9IGVsc2UgaWYgKHN0YXRlTmFtZSA9PT0gJ3NhdmVkJykgewogICAgZWwuaW5uZXJIVE1MID0gYDxzcGFuIGNsYXNzPSJmbGV4IGl0ZW1zLWNlbnRlciBnYXAtMS41IHRleHQtZ3JlZW4tNTAwIj4ke0lDT05TLmNoZWNrLnJlcGxhY2UoJ2ljb24nLCdpY29uLXNtJyl9IFNhdmVkPC9zcGFuPmA7CiAgICBzZXRUaW1lb3V0KCgpID0+IHsgaWYgKGVsKSBlbC50ZXh0Q29udGVudCA9ICdBdXRvLXNhdmUgZW5hYmxlZCc7IH0sIDE1MDApOwogIH0gZWxzZSB7CiAgICBlbC50ZXh0Q29udGVudCA9ICdBdXRvLXNhdmUgZW5hYmxlZCc7CiAgfQp9CgpsZXQgcGVuZGluZ1NhdmUgPSBudWxsOyAvLyB7IGlkLCB1cGRhdGVzIH0KbGV0IHBlbmRpbmdTYXZlVGltZXIgPSBudWxsOwoKZnVuY3Rpb24gcXVldWVBdXRvU2F2ZShpZCwgdXBkYXRlcykgewogIHBlbmRpbmdTYXZlID0geyBpZCwgdXBkYXRlcyB9OwogIGlmIChwZW5kaW5nU2F2ZVRpbWVyKSBjbGVhclRpbWVvdXQocGVuZGluZ1NhdmVUaW1lcik7CiAgcGVuZGluZ1NhdmVUaW1lciA9IHNldFRpbWVvdXQoZmx1c2hBdXRvU2F2ZSwgNjAwKTsKfQoKZnVuY3Rpb24gZmx1c2hBdXRvU2F2ZSgpIHsKICBpZiAocGVuZGluZ1NhdmVUaW1lcikgeyBjbGVhclRpbWVvdXQocGVuZGluZ1NhdmVUaW1lcik7IHBlbmRpbmdTYXZlVGltZXIgPSBudWxsOyB9CiAgaWYgKCFwZW5kaW5nU2F2ZSkgcmV0dXJuOwogIGNvbnN0IHsgaWQsIHVwZGF0ZXMgfSA9IHBlbmRpbmdTYXZlOwogIHBlbmRpbmdTYXZlID0gbnVsbDsKICB1cGRhdGVUYXNrKGlkLCB1cGRhdGVzKTsKICBzZXRTYXZlSW5kaWNhdG9yKCdzYXZlZCcpOwogIHJlbmRlclN0YXRzKCk7Cn0KCmZ1bmN0aW9uIG9wZW5UYXNrTW9kYWwodGFza0lkKSB7CiAgc3RhdGUuZWRpdGluZ1Rhc2tJZCA9IHRhc2tJZDsKICByZW5kZXJNb2RhbCgpOwp9CgpmdW5jdGlvbiBjbG9zZVRhc2tNb2RhbCgpIHsKICBmbHVzaEF1dG9TYXZlKCk7CiAgc3RhdGUuZWRpdGluZ1Rhc2tJZCA9IG51bGw7CiAgZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3Rhc2stbW9kYWwtY29udGFpbmVyJykuaW5uZXJIVE1MID0gJyc7CiAgcmVuZGVyVGFza0xpc3QoKTsKICByZW5kZXJTdGF0cygpOwp9CgpmdW5jdGlvbiByZW5kZXJNb2RhbCgpIHsKICBjb25zdCB0YXNrID0gZ2V0VGFza0J5SWQoc3RhdGUuZWRpdGluZ1Rhc2tJZCk7CiAgY29uc3QgY29udGFpbmVyID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3Rhc2stbW9kYWwtY29udGFpbmVyJyk7CiAgaWYgKCF0YXNrKSB7IGNvbnRhaW5lci5pbm5lckhUTUwgPSAnJzsgcmV0dXJuOyB9CgogIGNvbnRhaW5lci5pbm5lckhUTUwgPSBgCiAgICA8ZGl2IGlkPSJtb2RhbC1iYWNrZHJvcCIgY2xhc3M9ImZpeGVkIGluc2V0LTAgei01MCBmbGV4IGl0ZW1zLWNlbnRlciBqdXN0aWZ5LWNlbnRlciBwLTQgYmctYmxhY2svNTAgYmFja2Ryb3AtYmx1ci1zbSBhbmltLWZhZGUiPgogICAgICA8ZGl2IGlkPSJtb2RhbC1ib3giIGNsYXNzPSJiZy13aGl0ZSBkYXJrOmJnLWdyYXktOTAwIHJvdW5kZWQtMnhsIHNoYWRvdy0yeGwgdy1mdWxsIG1heC13LTJ4bCBtYXgtaC1bOTB2aF0gb3ZlcmZsb3cteS1hdXRvIGFuaW0tc2xpZGUiPgogICAgICAgIDxkaXYgY2xhc3M9InN0aWNreSB0b3AtMCBiZy13aGl0ZSBkYXJrOmJnLWdyYXktOTAwIGJvcmRlci1iIGJvcmRlci1ncmF5LTEwMCBkYXJrOmJvcmRlci1ncmF5LTgwMCBweC01IHNtOnB4LTYgcHktNCBmbGV4IGl0ZW1zLWNlbnRlciBqdXN0aWZ5LWJldHdlZW4gei0xMCI+CiAgICAgICAgICA8ZGl2IGlkPSJzYXZlLWluZGljYXRvciIgY2xhc3M9InRleHQtc20gZm9udC1tZWRpdW0gdGV4dC1ncmF5LTQwMCI+QXV0by1zYXZlIGVuYWJsZWQ8L2Rpdj4KICAgICAgICAgIDxidXR0b24gaWQ9Im1vZGFsLWNsb3NlIiBjbGFzcz0idy0xMCBoLTEwIGZsZXggaXRlbXMtY2VudGVyIGp1c3RpZnktY2VudGVyIHJvdW5kZWQteGwgaG92ZXI6YmctZ3JheS0xMDAgZGFyazpob3ZlcjpiZy1ncmF5LTgwMCI+JHtJQ09OUy54fTwvYnV0dG9uPgogICAgICAgIDwvZGl2PgoKICAgICAgICA8ZGl2IGNsYXNzPSJwLTUgc206cC02IHNwYWNlLXktNSI+CiAgICAgICAgICA8ZGl2PgogICAgICAgICAgICA8bGFiZWwgY2xhc3M9ImJsb2NrIHRleHQtc20gZm9udC1zZW1pYm9sZCBtYi0xLjUiPlRhc2sgTmFtZTwvbGFiZWw+CiAgICAgICAgICAgIDxpbnB1dCBpZD0ibW9kYWwtbmFtZSIgdHlwZT0idGV4dCIgdmFsdWU9IiR7ZXNjYXBlSHRtbCh0YXNrLnRhc2tOYW1lKX0iCiAgICAgICAgICAgICAgY2xhc3M9InctZnVsbCB0ZXh0LXhsIGZvbnQtYm9sZCBweC00IHB5LTMgcm91bmRlZC14bCBib3JkZXIgYm9yZGVyLWdyYXktMjAwIGRhcms6Ym9yZGVyLWdyYXktNzAwIGJnLWdyYXktNTAgZGFyazpiZy1ncmF5LTgwMCBmb2N1czpiZy13aGl0ZSBkYXJrOmZvY3VzOmJnLWdyYXktOTAwIG91dGxpbmUtbm9uZSBmb2N1czpyaW5nLTIgZm9jdXM6cmluZy1wcmltYXJ5LTUwMCIgLz4KICAgICAgICAgIDwvZGl2PgoKICAgICAgICAgIDxkaXY+CiAgICAgICAgICAgIDxsYWJlbCBjbGFzcz0iYmxvY2sgdGV4dC1zbSBmb250LXNlbWlib2xkIG1iLTEuNSI+RGVzY3JpcHRpb248L2xhYmVsPgogICAgICAgICAgICA8dGV4dGFyZWEgaWQ9Im1vZGFsLWRlc2NyaXB0aW9uIiByb3dzPSIzIiBwbGFjZWhvbGRlcj0iQWRkIG1vcmUgZGV0YWlscyBhYm91dCB0aGlzIHRhc2suLi4iCiAgICAgICAgICAgICAgY2xhc3M9InctZnVsbCBweC00IHB5LTMgcm91bmRlZC14bCBib3JkZXIgYm9yZGVyLWdyYXktMjAwIGRhcms6Ym9yZGVyLWdyYXktNzAwIGJnLWdyYXktNTAgZGFyazpiZy1ncmF5LTgwMCBmb2N1czpiZy13aGl0ZSBkYXJrOmZvY3VzOmJnLWdyYXktOTAwIHJlc2l6ZS1ub25lIG91dGxpbmUtbm9uZSBmb2N1czpyaW5nLTIgZm9jdXM6cmluZy1wcmltYXJ5LTUwMCI+JHtlc2NhcGVIdG1sKHRhc2suZGVzY3JpcHRpb24pfTwvdGV4dGFyZWE+CiAgICAgICAgICA8L2Rpdj4KCiAgICAgICAgICA8ZGl2IGNsYXNzPSJmbGV4IGZsZXgtY29sIHNtOmZsZXgtcm93IGdhcC00Ij4KICAgICAgICAgICAgPGRpdiBjbGFzcz0iZmxleC0xIj4KICAgICAgICAgICAgICA8bGFiZWwgY2xhc3M9ImJsb2NrIHRleHQtc20gZm9udC1zZW1pYm9sZCBtYi0xLjUiPlN0YXR1czwvbGFiZWw+CiAgICAgICAgICAgICAgPGRpdiBjbGFzcz0iZmxleCBnYXAtMiI+CiAgICAgICAgICAgICAgICAke1NUQVRVU19PUFRJT05TLm1hcCgob3B0KSA9PiBgCiAgICAgICAgICAgICAgICAgIDxidXR0b24gZGF0YS1zdGF0dXM9IiR7b3B0LnZhbHVlfSIgY2xhc3M9Im1vZGFsLXN0YXR1cy1idG4gZmxleC0xIHB4LTMgcHktMyByb3VuZGVkLXhsIHRleHQtc20gZm9udC1zZW1pYm9sZCB0cmFuc2l0aW9uLWNvbG9ycyAkewogICAgICAgICAgICAgICAgICAgIHRhc2suc3RhdHVzID09PSBvcHQudmFsdWUKICAgICAgICAgICAgICAgICAgICAgID8gJ2JnLXByaW1hcnktNjAwIHRleHQtd2hpdGUgc2hhZG93LW1kIHNoYWRvdy1wcmltYXJ5LTYwMC8zMCcKICAgICAgICAgICAgICAgICAgICAgIDogJ2JnLWdyYXktMTAwIGRhcms6YmctZ3JheS04MDAgdGV4dC1ncmF5LTYwMCBkYXJrOnRleHQtZ3JheS0zMDAgaG92ZXI6YmctZ3JheS0yMDAgZGFyazpob3ZlcjpiZy1ncmF5LTcwMCcKICAgICAgICAgICAgICAgICAgfSI+JHtvcHQubGFiZWx9PC9idXR0b24+CiAgICAgICAgICAgICAgICBgKS5qb2luKCcnKX0KICAgICAgICAgICAgICA8L2Rpdj4KICAgICAgICAgICAgPC9kaXY+CiAgICAgICAgICAgIDxkaXY+CiAgICAgICAgICAgICAgPGxhYmVsIGNsYXNzPSJibG9jayB0ZXh0LXNtIGZvbnQtc2VtaWJvbGQgbWItMS41Ij5Qcmlvcml0eTwvbGFiZWw+CiAgICAgICAgICAgICAgPGJ1dHRvbiBpZD0ibW9kYWwtdXJnZW50LWJ0biIgY2xhc3M9ImgtWzQ2cHhdIHB4LTQgcm91bmRlZC14bCB0ZXh0LXNtIGZvbnQtc2VtaWJvbGQgdHJhbnNpdGlvbi1jb2xvcnMgZmxleCBpdGVtcy1jZW50ZXIgZ2FwLTIgJHsKICAgICAgICAgICAgICAgIHRhc2suaXNVcmdlbnQgPyAnYmctcmVkLTYwMCB0ZXh0LXdoaXRlIHNoYWRvdy1tZCBzaGFkb3ctcmVkLTYwMC8zMCcgOiAnYmctZ3JheS0xMDAgZGFyazpiZy1ncmF5LTgwMCB0ZXh0LWdyYXktNjAwIGRhcms6dGV4dC1ncmF5LTMwMCBob3ZlcjpiZy1ncmF5LTIwMCBkYXJrOmhvdmVyOmJnLWdyYXktNzAwJwogICAgICAgICAgICAgIH0iPiR7SUNPTlMuYWxlcnR9ICR7dGFzay5pc1VyZ2VudCA/ICdVcmdlbnQnIDogJ01hcmsgVXJnZW50J308L2J1dHRvbj4KICAgICAgICAgICAgPC9kaXY+CiAgICAgICAgICA8L2Rpdj4KCiAgICAgICAgICA8ZGl2PgogICAgICAgICAgICA8bGFiZWwgY2xhc3M9ImJsb2NrIHRleHQtc20gZm9udC1zZW1pYm9sZCBtYi0xLjUiPkR1ZSBEYXRlPC9sYWJlbD4KICAgICAgICAgICAgPGlucHV0IGlkPSJtb2RhbC1kdWUtZGF0ZSIgdHlwZT0iZGF0ZSIgdmFsdWU9IiR7ZXNjYXBlSHRtbCh0YXNrLmR1ZURhdGUgfHwgJycpfSIKICAgICAgICAgICAgICBjbGFzcz0idy1mdWxsIHB4LTQgcHktMyByb3VuZGVkLXhsIGJvcmRlciBib3JkZXItZ3JheS0yMDAgZGFyazpib3JkZXItZ3JheS03MDAgYmctZ3JheS01MCBkYXJrOmJnLWdyYXktODAwIGZvY3VzOmJnLXdoaXRlIGRhcms6Zm9jdXM6YmctZ3JheS05MDAgb3V0bGluZS1ub25lIGZvY3VzOnJpbmctMiBmb2N1czpyaW5nLXByaW1hcnktNTAwIiAvPgogICAgICAgICAgPC9kaXY+CgogICAgICAgICAgPGRpdj4KICAgICAgICAgICAgPGxhYmVsIGNsYXNzPSJibG9jayB0ZXh0LXNtIGZvbnQtc2VtaWJvbGQgbWItMS41Ij5Ob3RlczwvbGFiZWw+CiAgICAgICAgICAgIDx0ZXh0YXJlYSBpZD0ibW9kYWwtbm90ZXMiIHJvd3M9IjMiIHBsYWNlaG9sZGVyPSJQZXJzb25hbCBub3RlcyBhYm91dCB0aGlzIHRhc2suLi4iCiAgICAgICAgICAgICAgY2xhc3M9InctZnVsbCBweC00IHB5LTMgcm91bmRlZC14bCBib3JkZXIgYm9yZGVyLWdyYXktMjAwIGRhcms6Ym9yZGVyLWdyYXktNzAwIGJnLWdyYXktNTAgZGFyazpiZy1ncmF5LTgwMCBmb2N1czpiZy13aGl0ZSBkYXJrOmZvY3VzOmJnLWdyYXktOTAwIHJlc2l6ZS1ub25lIG91dGxpbmUtbm9uZSBmb2N1czpyaW5nLTIgZm9jdXM6cmluZy1wcmltYXJ5LTUwMCI+JHtlc2NhcGVIdG1sKHRhc2subm90ZXMpfTwvdGV4dGFyZWE+CiAgICAgICAgICA8L2Rpdj4KCiAgICAgICAgICA8ZGl2IGNsYXNzPSJncmlkIGdyaWQtY29scy0zIGdhcC0zIHRleHQtc20gYmctZ3JheS01MCBkYXJrOmJnLWdyYXktODAwLzYwIHJvdW5kZWQteGwgcC0zIHNtOnAtNCI+CiAgICAgICAgICAgIDxkaXY+CiAgICAgICAgICAgICAgPHAgY2xhc3M9InRleHQtZ3JheS00MDAgdGV4dC14cyB1cHBlcmNhc2UgZm9udC1zZW1pYm9sZCBtYi0wLjUiPkNyZWF0ZWQ8L3A+CiAgICAgICAgICAgICAgPHAgY2xhc3M9ImZvbnQtbWVkaXVtIj4ke2Zvcm1hdERhdGVUaW1lKHRhc2suY3JlYXRlZEF0KX08L3A+CiAgICAgICAgICAgIDwvZGl2PgogICAgICAgICAgICA8ZGl2PgogICAgICAgICAgICAgIDxwIGNsYXNzPSJ0ZXh0LWdyYXktNDAwIHRleHQteHMgdXBwZXJjYXNlIGZvbnQtc2VtaWJvbGQgbWItMC41Ij5MYXN0IE1vZGlmaWVkPC9wPgogICAgICAgICAgICAgIDxwIGNsYXNzPSJmb250LW1lZGl1bSI+JHtmb3JtYXREYXRlVGltZSh0YXNrLnVwZGF0ZWRBdCl9PC9wPgogICAgICAgICAgICA8L2Rpdj4KICAgICAgICAgICAgPGRpdj4KICAgICAgICAgICAgICA8cCBjbGFzcz0idGV4dC1ncmF5LTQwMCB0ZXh0LXhzIHVwcGVyY2FzZSBmb250LXNlbWlib2xkIG1iLTAuNSI+JHt0YXNrLmFyY2hpdmVkQXQgPyAnQXJjaGl2ZWQnIDogJ0NvbXBsZXRlZCd9PC9wPgogICAgICAgICAgICAgIDxwIGNsYXNzPSJmb250LW1lZGl1bSI+JHt0YXNrLmFyY2hpdmVkQXQgPyBmb3JtYXREYXRlVGltZSh0YXNrLmFyY2hpdmVkQXQpIDogKHRhc2suY29tcGxldGVkQXQgPyBmb3JtYXREYXRlVGltZSh0YXNrLmNvbXBsZXRlZEF0KSA6ICfigJQnKX08L3A+CiAgICAgICAgICAgIDwvZGl2PgogICAgICAgICAgPC9kaXY+CgogICAgICAgICAgPGRpdj4KICAgICAgICAgICAgPGxhYmVsIGNsYXNzPSJmbGV4IGl0ZW1zLWNlbnRlciBnYXAtMiB0ZXh0LXNtIGZvbnQtc2VtaWJvbGQgbWItMiI+JHtJQ09OUy5tZXNzYWdlLnJlcGxhY2UoJ2ljb24nLCdpY29uLXNtJyl9IENvbW1lbnRzICgke3Rhc2suY29tbWVudHMubGVuZ3RofSk8L2xhYmVsPgogICAgICAgICAgICA8ZGl2IGlkPSJtb2RhbC1jb21tZW50cy1saXN0IiBjbGFzcz0ic3BhY2UteS0yIG1heC1oLTQ4IG92ZXJmbG93LXktYXV0byBtYi0zIHByLTEiPgogICAgICAgICAgICAgICR7dGFzay5jb21tZW50cy5sZW5ndGggPT09IDAKICAgICAgICAgICAgICAgID8gYDxwIGNsYXNzPSJ0ZXh0LXNtIHRleHQtZ3JheS00MDAgaXRhbGljIj5ObyBjb21tZW50cyB5ZXQuPC9wPmAKICAgICAgICAgICAgICAgIDogdGFzay5jb21tZW50cy5tYXAoKGMpID0+IGAKICAgICAgICAgICAgICAgICAgPGRpdiBjbGFzcz0iYmctZ3JheS01MCBkYXJrOmJnLWdyYXktODAwLzYwIHJvdW5kZWQteGwgcHgtMy41IHB5LTIuNSBmbGV4IGl0ZW1zLXN0YXJ0IGp1c3RpZnktYmV0d2VlbiBnYXAtMiI+CiAgICAgICAgICAgICAgICAgICAgPGRpdj4KICAgICAgICAgICAgICAgICAgICAgIDxwIGNsYXNzPSJ0ZXh0LXNtIj4ke2VzY2FwZUh0bWwoYy5jb250ZW50KX08L3A+CiAgICAgICAgICAgICAgICAgICAgICA8cCBjbGFzcz0idGV4dC14cyB0ZXh0LWdyYXktNDAwIG10LTEiPiR7Zm9ybWF0RGF0ZVRpbWUoYy5jcmVhdGVkQXQpfTwvcD4KICAgICAgICAgICAgICAgICAgICA8L2Rpdj4KICAgICAgICAgICAgICAgICAgICA8YnV0dG9uIGRhdGEtYWN0aW9uPSJkZWxldGUtY29tbWVudCIgZGF0YS1jb21tZW50LWlkPSIke2MuaWR9IiBjbGFzcz0idGV4dC1ncmF5LTMwMCBob3Zlcjp0ZXh0LXJlZC01MDAgZmxleC1zaHJpbmstMCI+JHtJQ09OUy54LnJlcGxhY2UoJ2ljb24nLCdpY29uLXNtJyl9PC9idXR0b24+CiAgICAgICAgICAgICAgICAgIDwvZGl2PgogICAgICAgICAgICAgICAgYCkuam9pbignJyl9CiAgICAgICAgICAgIDwvZGl2PgogICAgICAgICAgICA8ZGl2IGNsYXNzPSJmbGV4IGdhcC0yIj4KICAgICAgICAgICAgICA8aW5wdXQgaWQ9Im1vZGFsLW5ldy1jb21tZW50IiB0eXBlPSJ0ZXh0IiBwbGFjZWhvbGRlcj0iQWRkIGEgY29tbWVudC4uLiIKICAgICAgICAgICAgICAgIGNsYXNzPSJmbGV4LTEgcHgtNCBweS0yLjUgcm91bmRlZC14bCBib3JkZXIgYm9yZGVyLWdyYXktMjAwIGRhcms6Ym9yZGVyLWdyYXktNzAwIGJnLWdyYXktNTAgZGFyazpiZy1ncmF5LTgwMCBmb2N1czpiZy13aGl0ZSBkYXJrOmZvY3VzOmJnLWdyYXktOTAwIG91dGxpbmUtbm9uZSBmb2N1czpyaW5nLTIgZm9jdXM6cmluZy1wcmltYXJ5LTUwMCIgLz4KICAgICAgICAgICAgICA8YnV0dG9uIGlkPSJtb2RhbC1hZGQtY29tbWVudCIgY2xhc3M9InctMTEgaC0xMSBmbGV4IGl0ZW1zLWNlbnRlciBqdXN0aWZ5LWNlbnRlciByb3VuZGVkLXhsIGJnLXByaW1hcnktNjAwIHRleHQtd2hpdGUiPiR7SUNPTlMuc2VuZH08L2J1dHRvbj4KICAgICAgICAgICAgPC9kaXY+CiAgICAgICAgICA8L2Rpdj4KICAgICAgICA8L2Rpdj4KCiAgICAgICAgPGRpdiBjbGFzcz0ic3RpY2t5IGJvdHRvbS0wIGJnLXdoaXRlIGRhcms6YmctZ3JheS05MDAgYm9yZGVyLXQgYm9yZGVyLWdyYXktMTAwIGRhcms6Ym9yZGVyLWdyYXktODAwIHB4LTUgc206cHgtNiBweS00IGZsZXggaXRlbXMtY2VudGVyIGp1c3RpZnktYmV0d2VlbiI+CiAgICAgICAgICA8YnV0dG9uIGlkPSJtb2RhbC1kZWxldGUiIGNsYXNzPSJmbGV4IGl0ZW1zLWNlbnRlciBnYXAtMiBweC00IHB5LTIuNSByb3VuZGVkLXhsIHRleHQtcmVkLTYwMCBob3ZlcjpiZy1yZWQtNTAgZGFyazpob3ZlcjpiZy1yZWQtOTUwLzQwIGZvbnQtc2VtaWJvbGQiPiR7SUNPTlMudHJhc2h9IERlbGV0ZTwvYnV0dG9uPgogICAgICAgICAgPGJ1dHRvbiBpZD0ibW9kYWwtZG9uZSIgY2xhc3M9ImZsZXggaXRlbXMtY2VudGVyIGdhcC0yIHB4LTYgcHktMi41IHJvdW5kZWQteGwgYmctcHJpbWFyeS02MDAgaG92ZXI6YmctcHJpbWFyeS03MDAgdGV4dC13aGl0ZSBmb250LXNlbWlib2xkIHNoYWRvdy1tZCBzaGFkb3ctcHJpbWFyeS02MDAvMzAiPiR7SUNPTlMuY2hlY2t9IERvbmU8L2J1dHRvbj4KICAgICAgICA8L2Rpdj4KICAgICAgPC9kaXY+CiAgICA8L2Rpdj4KICBgOwoKICB3aXJlTW9kYWxFdmVudHModGFzayk7Cn0KCmZ1bmN0aW9uIHdpcmVNb2RhbEV2ZW50cyh0YXNrKSB7CiAgY29uc3QgbmFtZUlucHV0ID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ21vZGFsLW5hbWUnKTsKICBjb25zdCBkZXNjSW5wdXQgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnbW9kYWwtZGVzY3JpcHRpb24nKTsKICBjb25zdCBub3Rlc0lucHV0ID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ21vZGFsLW5vdGVzJyk7CiAgY29uc3QgZHVlRGF0ZUlucHV0ID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ21vZGFsLWR1ZS1kYXRlJyk7CgogIGNvbnN0IHRyaWdnZXJTYXZlID0gKCkgPT4gewogICAgc2V0U2F2ZUluZGljYXRvcignc2F2aW5nJyk7CiAgICBxdWV1ZUF1dG9TYXZlKHRhc2suaWQsIHsKICAgICAgdGFza05hbWU6IG5hbWVJbnB1dC52YWx1ZSwKICAgICAgZGVzY3JpcHRpb246IGRlc2NJbnB1dC52YWx1ZSwKICAgICAgbm90ZXM6IG5vdGVzSW5wdXQudmFsdWUsCiAgICAgIGR1ZURhdGU6IGR1ZURhdGVJbnB1dC52YWx1ZSwKICAgIH0pOwogIH07CgogIG5hbWVJbnB1dC5hZGRFdmVudExpc3RlbmVyKCdpbnB1dCcsIHRyaWdnZXJTYXZlKTsKICBkZXNjSW5wdXQuYWRkRXZlbnRMaXN0ZW5lcignaW5wdXQnLCB0cmlnZ2VyU2F2ZSk7CiAgbm90ZXNJbnB1dC5hZGRFdmVudExpc3RlbmVyKCdpbnB1dCcsIHRyaWdnZXJTYXZlKTsKICBkdWVEYXRlSW5wdXQuYWRkRXZlbnRMaXN0ZW5lcignY2hhbmdlJywgdHJpZ2dlclNhdmUpOwoKICBkb2N1bWVudC5xdWVyeVNlbGVjdG9yQWxsKCcubW9kYWwtc3RhdHVzLWJ0bicpLmZvckVhY2goKGJ0bikgPT4gewogICAgYnRuLmFkZEV2ZW50TGlzdGVuZXIoJ2NsaWNrJywgKCkgPT4gewogICAgICBmbHVzaEF1dG9TYXZlKCk7CiAgICAgIHVwZGF0ZVRhc2sodGFzay5pZCwgeyBzdGF0dXM6IGJ0bi5kYXRhc2V0LnN0YXR1cyB9KTsKICAgICAgcmVuZGVyTW9kYWwoKTsKICAgICAgcmVuZGVyU3RhdHMoKTsKICAgIH0pOwogIH0pOwoKICBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnbW9kYWwtdXJnZW50LWJ0bicpLmFkZEV2ZW50TGlzdGVuZXIoJ2NsaWNrJywgKCkgPT4gewogICAgZmx1c2hBdXRvU2F2ZSgpOwogICAgdXBkYXRlVGFzayh0YXNrLmlkLCB7IGlzVXJnZW50OiAhdGFzay5pc1VyZ2VudCB9KTsKICAgIHJlbmRlck1vZGFsKCk7CiAgICByZW5kZXJTdGF0cygpOwogIH0pOwoKICBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnbW9kYWwtYWRkLWNvbW1lbnQnKS5hZGRFdmVudExpc3RlbmVyKCdjbGljaycsICgpID0+IHsKICAgIGNvbnN0IGlucHV0ID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ21vZGFsLW5ldy1jb21tZW50Jyk7CiAgICBpZiAoIWlucHV0LnZhbHVlLnRyaW0oKSkgcmV0dXJuOwogICAgZmx1c2hBdXRvU2F2ZSgpOwogICAgYWRkQ29tbWVudCh0YXNrLmlkLCBpbnB1dC52YWx1ZSk7CiAgICByZW5kZXJNb2RhbCgpOwogIH0pOwoKICBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnbW9kYWwtbmV3LWNvbW1lbnQnKS5hZGRFdmVudExpc3RlbmVyKCdrZXlkb3duJywgKGUpID0+IHsKICAgIGlmIChlLmtleSA9PT0gJ0VudGVyJykgewogICAgICBlLnByZXZlbnREZWZhdWx0KCk7CiAgICAgIGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdtb2RhbC1hZGQtY29tbWVudCcpLmNsaWNrKCk7CiAgICB9CiAgfSk7CgogIGRvY3VtZW50LnF1ZXJ5U2VsZWN0b3JBbGwoJ1tkYXRhLWFjdGlvbj0iZGVsZXRlLWNvbW1lbnQiXScpLmZvckVhY2goKGJ0bikgPT4gewogICAgYnRuLmFkZEV2ZW50TGlzdGVuZXIoJ2NsaWNrJywgKCkgPT4gewogICAgICBmbHVzaEF1dG9TYXZlKCk7CiAgICAgIGRlbGV0ZUNvbW1lbnQodGFzay5pZCwgYnRuLmRhdGFzZXQuY29tbWVudElkKTsKICAgICAgcmVuZGVyTW9kYWwoKTsKICAgIH0pOwogIH0pOwoKICBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnbW9kYWwtZGVsZXRlJykuYWRkRXZlbnRMaXN0ZW5lcignY2xpY2snLCAoKSA9PiB7CiAgICBpZiAoIXdpbmRvdy5jb25maXJtKGBEZWxldGUgdGFzayAiJHt0YXNrLnRhc2tOYW1lfSI/IFRoaXMgY2Fubm90IGJlIHVuZG9uZS5gKSkgcmV0dXJuOwogICAgZmx1c2hBdXRvU2F2ZSgpOwogICAgZGVsZXRlVGFzayh0YXNrLmlkKTsKICAgIGNsb3NlVGFza01vZGFsKCk7CiAgfSk7CgogIGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdtb2RhbC1jbG9zZScpLmFkZEV2ZW50TGlzdGVuZXIoJ2NsaWNrJywgY2xvc2VUYXNrTW9kYWwpOwogIGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdtb2RhbC1kb25lJykuYWRkRXZlbnRMaXN0ZW5lcignY2xpY2snLCBjbG9zZVRhc2tNb2RhbCk7CiAgZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ21vZGFsLWJhY2tkcm9wJykuYWRkRXZlbnRMaXN0ZW5lcignY2xpY2snLCAoZSkgPT4gewogICAgaWYgKGUudGFyZ2V0LmlkID09PSAnbW9kYWwtYmFja2Ryb3AnKSBjbG9zZVRhc2tNb2RhbCgpOwogIH0pOwp9Cjwvc2NyaXB0Pgo8c2NyaXB0PgovLyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KLy8gVG9hc3QgbWVzc2FnZXMKLy8gLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCmZ1bmN0aW9uIHNob3dUb2FzdCh0eXBlLCB0ZXh0KSB7CiAgY29uc3QgY29udGFpbmVyID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3RvYXN0LWNvbnRhaW5lcicpOwogIGlmICghY29udGFpbmVyKSByZXR1cm47CiAgY29uc3QgY29sb3JzID0gdHlwZSA9PT0gJ3N1Y2Nlc3MnCiAgICA/ICdiZy1ncmVlbi01MCBkYXJrOmJnLWdyZWVuLTk1MC8zMCB0ZXh0LWdyZWVuLTcwMCBkYXJrOnRleHQtZ3JlZW4tNDAwJwogICAgOiAnYmctcmVkLTUwIGRhcms6YmctcmVkLTk1MC8zMCB0ZXh0LXJlZC03MDAgZGFyazp0ZXh0LXJlZC00MDAnOwogIGNvbnN0IGljb24gPSB0eXBlID09PSAnc3VjY2VzcycgPyBJQ09OUy5jaGVjayA6IElDT05TLng7CiAgY29udGFpbmVyLmlubmVySFRNTCA9IGAKICAgIDxkaXYgY2xhc3M9ImZsZXggaXRlbXMtc3RhcnQgZ2FwLTIgdGV4dC1zbSByb3VuZGVkLXhsIHB4LTMuNSBweS0yLjUgYW5pbS1mYWRlICR7Y29sb3JzfSI+CiAgICAgICR7aWNvbi5yZXBsYWNlKCdpY29uJywgJ2ljb24tc20nKX08c3Bhbj4ke2VzY2FwZUh0bWwodGV4dCl9PC9zcGFuPgogICAgPC9kaXY+CiAgYDsKICBzZXRUaW1lb3V0KCgpID0+IHsgaWYgKGNvbnRhaW5lci5maXJzdEVsZW1lbnRDaGlsZCkgY29udGFpbmVyLmlubmVySFRNTCA9ICcnOyB9LCA1MDAwKTsKfQoKZnVuY3Rpb24gc2hvd1VuZG9Ub2FzdCh0ZXh0LCBvblVuZG8pIHsKICBjb25zdCBjb250YWluZXIgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgndG9hc3QtY29udGFpbmVyJyk7CiAgaWYgKCFjb250YWluZXIpIHJldHVybjsKICBjb250YWluZXIuaW5uZXJIVE1MID0gYAogICAgPGRpdiBjbGFzcz0iZmxleCBpdGVtcy1jZW50ZXIganVzdGlmeS1iZXR3ZWVuIGdhcC0zIHRleHQtc20gcm91bmRlZC14bCBweC0zLjUgcHktMi41IGFuaW0tZmFkZSBiZy1ncmVlbi01MCBkYXJrOmJnLWdyZWVuLTk1MC8zMCB0ZXh0LWdyZWVuLTcwMCBkYXJrOnRleHQtZ3JlZW4tNDAwIj4KICAgICAgPHNwYW4gY2xhc3M9ImZsZXggaXRlbXMtY2VudGVyIGdhcC0yIj4ke0lDT05TLmNoZWNrLnJlcGxhY2UoJ2ljb24nLCAnaWNvbi1zbScpfSR7ZXNjYXBlSHRtbCh0ZXh0KX08L3NwYW4+CiAgICAgIDxidXR0b24gaWQ9InRvYXN0LXVuZG8tYnRuIiBjbGFzcz0iZm9udC1ib2xkIHVuZGVybGluZSBmbGV4LXNocmluay0wIj5VbmRvPC9idXR0b24+CiAgICA8L2Rpdj4KICBgOwogIGNvbnN0IHVuZG9CdG4gPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgndG9hc3QtdW5kby1idG4nKTsKICBpZiAodW5kb0J0bikgewogICAgdW5kb0J0bi5hZGRFdmVudExpc3RlbmVyKCdjbGljaycsICgpID0+IHsKICAgICAgY29udGFpbmVyLmlubmVySFRNTCA9ICcnOwogICAgICBvblVuZG8oKTsKICAgIH0pOwogIH0KICBzZXRUaW1lb3V0KCgpID0+IHsgaWYgKGNvbnRhaW5lci5maXJzdEVsZW1lbnRDaGlsZCkgY29udGFpbmVyLmlubmVySFRNTCA9ICcnOyB9LCA2MDAwKTsKfQoKLy8gLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCi8vIEltcG9ydDogRXhjZWwgLyBDU1YKLy8gLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCmZ1bmN0aW9uIGltcG9ydEV4Y2VsRmlsZShmaWxlKSB7CiAgY29uc3QgcmVhZGVyID0gbmV3IEZpbGVSZWFkZXIoKTsKICByZWFkZXIub25sb2FkID0gKGUpID0+IHsKICAgIHRyeSB7CiAgICAgIGNvbnN0IGRhdGEgPSBuZXcgVWludDhBcnJheShlLnRhcmdldC5yZXN1bHQpOwogICAgICBjb25zdCB3b3JrYm9vayA9IFhMU1gucmVhZChkYXRhLCB7IHR5cGU6ICdhcnJheScgfSk7CiAgICAgIGNvbnN0IHNoZWV0TmFtZSA9IHdvcmtib29rLlNoZWV0TmFtZXNbMF07CiAgICAgIGNvbnN0IHNoZWV0ID0gd29ya2Jvb2suU2hlZXRzW3NoZWV0TmFtZV07CiAgICAgIGNvbnN0IHJvd3MgPSBYTFNYLnV0aWxzLnNoZWV0X3RvX2pzb24oc2hlZXQsIHsgZGVmdmFsOiAnJyB9KTsKCiAgICAgIGlmICghcm93cy5sZW5ndGgpIHsKICAgICAgICBzaG93VG9hc3QoJ2Vycm9yJywgJ1RoZSBmaWxlIGRvZXMgbm90IGNvbnRhaW4gYW55IHJvd3MuJyk7CiAgICAgICAgcmV0dXJuOwogICAgICB9CgogICAgICBsZXQgaW1wb3J0ZWQgPSAwOwogICAgICByb3dzLmZvckVhY2goKHJvdykgPT4gewogICAgICAgIGNvbnN0IGtleXMgPSBPYmplY3Qua2V5cyhyb3cpOwogICAgICAgIGNvbnN0IG5hbWVLZXkgPSBrZXlzLmZpbmQoKGspID0+IC9eXHMqdGFza1xzKm5hbWVccyokL2kudGVzdChrKSkgfHwga2V5cy5maW5kKChrKSA9PiAvXlxzKm5hbWVccyokL2kudGVzdChrKSkgfHwga2V5cy5maW5kKChrKSA9PiAvXlxzKnRhc2tccyokL2kudGVzdChrKSk7CiAgICAgICAgY29uc3QgZGVzY0tleSA9IGtleXMuZmluZCgoaykgPT4gL15ccypkZXNjcmlwdGlvblxzKiQvaS50ZXN0KGspKTsKICAgICAgICBjb25zdCB1cmdlbnRLZXkgPSBrZXlzLmZpbmQoKGspID0+IC9eXHMqdXJnZW50XHMqJC9pLnRlc3QoaykpOwoKICAgICAgICBjb25zdCB0YXNrTmFtZSA9IG5hbWVLZXkgPyBTdHJpbmcocm93W25hbWVLZXldKS50cmltKCkgOiAnJzsKICAgICAgICBpZiAoIXRhc2tOYW1lKSByZXR1cm47CgogICAgICAgIGNvbnN0IGRlc2NyaXB0aW9uID0gZGVzY0tleSA/IFN0cmluZyhyb3dbZGVzY0tleV0pLnRyaW0oKSA6ICcnOwogICAgICAgIGNvbnN0IGlzVXJnZW50ID0gdXJnZW50S2V5ID8gaXNUcnV0aHlWYWx1ZShyb3dbdXJnZW50S2V5XSkgOiBmYWxzZTsKCiAgICAgICAgY3JlYXRlVGFzayh7IHRhc2tOYW1lLCBkZXNjcmlwdGlvbiwgaXNVcmdlbnQsIHN0YXR1czogJ3BlbmRpbmcnIH0pOwogICAgICAgIGltcG9ydGVkKys7CiAgICAgIH0pOwoKICAgICAgc2hvd1RvYXN0KCdzdWNjZXNzJywgYEltcG9ydGVkICR7aW1wb3J0ZWR9IHRhc2ske2ltcG9ydGVkID09PSAxID8gJycgOiAncyd9IHN1Y2Nlc3NmdWxseS5gKTsKICAgICAgcmVuZGVyU3RhdHMoKTsKICAgICAgcmVuZGVyVGFza0xpc3QoKTsKICAgIH0gY2F0Y2ggKGVycikgewogICAgICBzaG93VG9hc3QoJ2Vycm9yJywgJ0NvdWxkIG5vdCByZWFkIHRoZSB1cGxvYWRlZCBmaWxlLiBNYWtlIHN1cmUgaXQgaXMgYSB2YWxpZCBFeGNlbCBvciBDU1YgZmlsZS4nKTsKICAgIH0KICB9OwogIHJlYWRlci5yZWFkQXNBcnJheUJ1ZmZlcihmaWxlKTsKfQoKLy8gLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCi8vIEltcG9ydDogV29yZCAoLmRvY3gpCi8vIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQpmdW5jdGlvbiBpbXBvcnRXb3JkRmlsZShmaWxlKSB7CiAgY29uc3QgcmVhZGVyID0gbmV3IEZpbGVSZWFkZXIoKTsKICByZWFkZXIub25sb2FkID0gKGUpID0+IHsKICAgIG1hbW1vdGguZXh0cmFjdFJhd1RleHQoeyBhcnJheUJ1ZmZlcjogZS50YXJnZXQucmVzdWx0IH0pCiAgICAgIC50aGVuKChyZXN1bHQpID0+IHsKICAgICAgICBjb25zdCBsaW5lcyA9IHJlc3VsdC52YWx1ZQogICAgICAgICAgLnNwbGl0KCdcbicpCiAgICAgICAgICAubWFwKChsaW5lKSA9PiBsaW5lLnJlcGxhY2UoL15bXHPigKJcLSpcdTIwMjJcdTI1Q0ZcdTI1QUFdKy8sICcnKS50cmltKCkpCiAgICAgICAgICAuZmlsdGVyKChsaW5lKSA9PiBsaW5lLmxlbmd0aCA+IDApOwoKICAgICAgICBpZiAoIWxpbmVzLmxlbmd0aCkgewogICAgICAgICAgc2hvd1RvYXN0KCdlcnJvcicsICdObyB0ZXh0IGNvbnRlbnQgd2FzIGZvdW5kIGluIHRoZSBkb2N1bWVudC4nKTsKICAgICAgICAgIHJldHVybjsKICAgICAgICB9CgogICAgICAgIGxpbmVzLmZvckVhY2goKGxpbmUpID0+IGNyZWF0ZVRhc2soeyB0YXNrTmFtZTogbGluZSwgc3RhdHVzOiAncGVuZGluZycgfSkpOwogICAgICAgIHNob3dUb2FzdCgnc3VjY2VzcycsIGBJbXBvcnRlZCAke2xpbmVzLmxlbmd0aH0gdGFzayR7bGluZXMubGVuZ3RoID09PSAxID8gJycgOiAncyd9IHN1Y2Nlc3NmdWxseS5gKTsKICAgICAgICByZW5kZXJTdGF0cygpOwogICAgICAgIHJlbmRlclRhc2tMaXN0KCk7CiAgICAgIH0pCiAgICAgIC5jYXRjaCgoKSA9PiBzaG93VG9hc3QoJ2Vycm9yJywgJ0NvdWxkIG5vdCByZWFkIHRoZSB1cGxvYWRlZCBXb3JkIGRvY3VtZW50LicpKTsKICB9OwogIHJlYWRlci5yZWFkQXNBcnJheUJ1ZmZlcihmaWxlKTsKfQoKZnVuY3Rpb24gaGFuZGxlSW1wb3J0RmlsZShmaWxlKSB7CiAgaWYgKCFmaWxlKSByZXR1cm47CiAgY29uc3QgZXh0ID0gZmlsZS5uYW1lLnNwbGl0KCcuJykucG9wKCkudG9Mb3dlckNhc2UoKTsKICBpZiAoWyd4bHN4JywgJ3hscycsICdjc3YnXS5pbmNsdWRlcyhleHQpKSB7CiAgICBpbXBvcnRFeGNlbEZpbGUoZmlsZSk7CiAgfSBlbHNlIGlmIChleHQgPT09ICdkb2N4JykgewogICAgaW1wb3J0V29yZEZpbGUoZmlsZSk7CiAgfSBlbHNlIHsKICAgIHNob3dUb2FzdCgnZXJyb3InLCAnVW5zdXBwb3J0ZWQgZmlsZSB0eXBlLiBVc2UgLnhsc3gsIC54bHMsIC5jc3Ygb3IgLmRvY3gnKTsKICB9Cn0KCi8vIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQovLyBFeHBvcnQ6IEV4Y2VsICYgUERGCi8vIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQpmdW5jdGlvbiBzdGF0dXNMYWJlbChzdGF0dXMpIHsKICByZXR1cm4geyBwZW5kaW5nOiAnUGVuZGluZycsIGluX3Byb2dyZXNzOiAnSW4gUHJvZ3Jlc3MnLCBjb21wbGV0ZWQ6ICdDb21wbGV0ZWQnIH1bc3RhdHVzXSB8fCBzdGF0dXM7Cn0KCmZ1bmN0aW9uIGV4cG9ydEV4Y2VsKCkgewogIGNvbnN0IHNvcnRlZCA9IHN0YXRlLnRhc2tzLnNsaWNlKCkuc29ydCgoYSwgYikgPT4gewogICAgaWYgKGEuaXNVcmdlbnQgIT09IGIuaXNVcmdlbnQpIHJldHVybiBhLmlzVXJnZW50ID8gLTEgOiAxOwogICAgY29uc3Qgc2EgPSBTVEFUVVNfT1JERVJbYS5zdGF0dXNdID8/IDM7CiAgICBjb25zdCBzYiA9IFNUQVRVU19PUkRFUltiLnN0YXR1c10gPz8gMzsKICAgIGlmIChzYSAhPT0gc2IpIHJldHVybiBzYSAtIHNiOwogICAgcmV0dXJuIG5ldyBEYXRlKGIuY3JlYXRlZEF0KSAtIG5ldyBEYXRlKGEuY3JlYXRlZEF0KTsKICB9KTsKCiAgY29uc3QgZGF0YSA9IHNvcnRlZC5tYXAoKHQpID0+ICh7CiAgICAnVGFzayBOYW1lJzogdC50YXNrTmFtZSwKICAgIERlc2NyaXB0aW9uOiB0LmRlc2NyaXB0aW9uLAogICAgU3RhdHVzOiBzdGF0dXNMYWJlbCh0LnN0YXR1cyksCiAgICBVcmdlbnQ6IHQuaXNVcmdlbnQgPyAnWWVzJyA6ICdObycsCiAgICAnRHVlIERhdGUnOiB0LmR1ZURhdGUgfHwgJycsCiAgICBOb3RlczogdC5ub3RlcywKICAgICdDcmVhdGVkIERhdGUnOiBmb3JtYXREYXRlVGltZSh0LmNyZWF0ZWRBdCksCiAgICAnTGFzdCBNb2RpZmllZCc6IGZvcm1hdERhdGVUaW1lKHQudXBkYXRlZEF0KSwKICAgICdDb21wbGV0aW9uIERhdGUnOiB0LmNvbXBsZXRlZEF0ID8gZm9ybWF0RGF0ZVRpbWUodC5jb21wbGV0ZWRBdCkgOiAnJywKICAgICdBcmNoaXZlZCBEYXRlJzogdC5hcmNoaXZlZEF0ID8gZm9ybWF0RGF0ZVRpbWUodC5hcmNoaXZlZEF0KSA6ICcnLAogIH0pKTsKCiAgY29uc3Qgd29ya3NoZWV0ID0gWExTWC51dGlscy5qc29uX3RvX3NoZWV0KGRhdGEpOwogIHdvcmtzaGVldFsnIWNvbHMnXSA9IFt7IHdjaDogMzAgfSwgeyB3Y2g6IDQwIH0sIHsgd2NoOiAxNCB9LCB7IHdjaDogOCB9LCB7IHdjaDogMTQgfSwgeyB3Y2g6IDQwIH0sIHsgd2NoOiAyMCB9LCB7IHdjaDogMjAgfSwgeyB3Y2g6IDIwIH0sIHsgd2NoOiAyMCB9XTsKCiAgY29uc3Qgd29ya2Jvb2sgPSBYTFNYLnV0aWxzLmJvb2tfbmV3KCk7CiAgWExTWC51dGlscy5ib29rX2FwcGVuZF9zaGVldCh3b3JrYm9vaywgd29ya3NoZWV0LCAnVGFza3MnKTsKICBYTFNYLndyaXRlRmlsZSh3b3JrYm9vaywgJ2R1dHktbGlzdC10YXNrcy54bHN4Jyk7Cn0KCmZ1bmN0aW9uIGV4cG9ydFBERigpIHsKICBjb25zdCB7IGpzUERGIH0gPSB3aW5kb3cuanNwZGY7CiAgY29uc3QgZG9jID0gbmV3IGpzUERGKHsgdW5pdDogJ3B0JywgZm9ybWF0OiAnYTQnIH0pOwogIGNvbnN0IG1hcmdpbiA9IDQwOwogIGxldCB5ID0gbWFyZ2luOwogIGNvbnN0IHBhZ2VIZWlnaHQgPSBkb2MuaW50ZXJuYWwucGFnZVNpemUuZ2V0SGVpZ2h0KCk7CiAgY29uc3QgcGFnZVdpZHRoID0gZG9jLmludGVybmFsLnBhZ2VTaXplLmdldFdpZHRoKCk7CgogIGNvbnN0IHNvcnRlZCA9IHN0YXRlLnRhc2tzLnNsaWNlKCkuc29ydCgoYSwgYikgPT4gewogICAgaWYgKGEuaXNVcmdlbnQgIT09IGIuaXNVcmdlbnQpIHJldHVybiBhLmlzVXJnZW50ID8gLTEgOiAxOwogICAgY29uc3Qgc2EgPSBTVEFUVVNfT1JERVJbYS5zdGF0dXNdID8/IDM7CiAgICBjb25zdCBzYiA9IFNUQVRVU19PUkRFUltiLnN0YXR1c10gPz8gMzsKICAgIGlmIChzYSAhPT0gc2IpIHJldHVybiBzYSAtIHNiOwogICAgcmV0dXJuIG5ldyBEYXRlKGIuY3JlYXRlZEF0KSAtIG5ldyBEYXRlKGEuY3JlYXRlZEF0KTsKICB9KTsKCiAgZG9jLnNldEZvbnQoJ2hlbHZldGljYScsICdib2xkJyk7CiAgZG9jLnNldEZvbnRTaXplKDIwKTsKICBkb2MudGV4dCgnRHV0eSBMaXN0IC0gVGFzayBSZXBvcnQnLCBwYWdlV2lkdGggLyAyLCB5LCB7IGFsaWduOiAnY2VudGVyJyB9KTsKICB5ICs9IDIwOwoKICBkb2Muc2V0Rm9udCgnaGVsdmV0aWNhJywgJ25vcm1hbCcpOwogIGRvYy5zZXRGb250U2l6ZSgxMCk7CiAgZG9jLnNldFRleHRDb2xvcigxMjApOwogIGRvYy50ZXh0KGBHZW5lcmF0ZWQgb24gJHtuZXcgRGF0ZSgpLnRvTG9jYWxlU3RyaW5nKCl9YCwgcGFnZVdpZHRoIC8gMiwgeSwgeyBhbGlnbjogJ2NlbnRlcicgfSk7CiAgeSArPSAyNTsKCiAgY29uc3Qgc3RhdHMgPSBjb21wdXRlU3RhdHMoKTsKICBkb2Muc2V0VGV4dENvbG9yKDApOwogIGRvYy5zZXRGb250KCdoZWx2ZXRpY2EnLCAnYm9sZCcpOwogIGRvYy5zZXRGb250U2l6ZSgxMSk7CiAgZG9jLnRleHQoYFRvdGFsOiAke3N0YXRzLnRvdGFsfSAgIFBlbmRpbmc6ICR7c3RhdHMucGVuZGluZ30gICBJbiBQcm9ncmVzczogJHtzdGF0cy5pblByb2dyZXNzfSAgIENvbXBsZXRlZDogJHtzdGF0cy5jb21wbGV0ZWR9ICAgVXJnZW50OiAke3N0YXRzLnVyZ2VudH1gLCBtYXJnaW4sIHkpOwogIHkgKz0gMjU7CgogIGNvbnN0IG1heFdpZHRoID0gcGFnZVdpZHRoIC0gbWFyZ2luICogMjsKCiAgc29ydGVkLmZvckVhY2goKHRhc2ssIGluZGV4KSA9PiB7CiAgICBpZiAoeSA+IHBhZ2VIZWlnaHQgLSA4MCkgeyBkb2MuYWRkUGFnZSgpOyB5ID0gbWFyZ2luOyB9CgogICAgZG9jLnNldEZvbnQoJ2hlbHZldGljYScsICdib2xkJyk7CiAgICBkb2Muc2V0Rm9udFNpemUoMTMpOwogICAgZG9jLnNldFRleHRDb2xvcigwKTsKICAgIGxldCB0aXRsZSA9IGAke2luZGV4ICsgMX0uICR7dGFzay50YXNrTmFtZX1gOwogICAgaWYgKHRhc2suaXNVcmdlbnQpIHRpdGxlICs9ICcgICBbVVJHRU5UXSc7CiAgICBjb25zdCB0aXRsZUxpbmVzID0gZG9jLnNwbGl0VGV4dFRvU2l6ZSh0aXRsZSwgbWF4V2lkdGgpOwogICAgZG9jLnRleHQodGl0bGVMaW5lcywgbWFyZ2luLCB5KTsKICAgIHkgKz0gdGl0bGVMaW5lcy5sZW5ndGggKiAxNjsKCiAgICBkb2Muc2V0Rm9udCgnaGVsdmV0aWNhJywgJ25vcm1hbCcpOwogICAgZG9jLnNldEZvbnRTaXplKDEwKTsKICAgIGRvYy5zZXRUZXh0Q29sb3IoODUpOwogICAgZG9jLnRleHQoYFN0YXR1czogJHtzdGF0dXNMYWJlbCh0YXNrLnN0YXR1cyl9YCwgbWFyZ2luLCB5KTsKICAgIHkgKz0gMTQ7CgogICAgaWYgKHRhc2suZGVzY3JpcHRpb24pIHsKICAgICAgZG9jLnNldFRleHRDb2xvcigwKTsKICAgICAgY29uc3QgbGluZXMgPSBkb2Muc3BsaXRUZXh0VG9TaXplKGBEZXNjcmlwdGlvbjogJHt0YXNrLmRlc2NyaXB0aW9ufWAsIG1heFdpZHRoKTsKICAgICAgZG9jLnRleHQobGluZXMsIG1hcmdpbiwgeSk7CiAgICAgIHkgKz0gbGluZXMubGVuZ3RoICogMTQ7CiAgICB9CgogICAgaWYgKHRhc2subm90ZXMpIHsKICAgICAgZG9jLnNldFRleHRDb2xvcigwKTsKICAgICAgY29uc3QgbGluZXMgPSBkb2Muc3BsaXRUZXh0VG9TaXplKGBOb3RlczogJHt0YXNrLm5vdGVzfWAsIG1heFdpZHRoKTsKICAgICAgZG9jLnRleHQobGluZXMsIG1hcmdpbiwgeSk7CiAgICAgIHkgKz0gbGluZXMubGVuZ3RoICogMTQ7CiAgICB9CgogICAgZG9jLnNldEZvbnRTaXplKDkpOwogICAgZG9jLnNldFRleHRDb2xvcigxNDApOwogICAgbGV0IG1ldGEgPSBgQ3JlYXRlZDogJHtmb3JtYXREYXRlVGltZSh0YXNrLmNyZWF0ZWRBdCl9ICAgfCAgIExhc3QgTW9kaWZpZWQ6ICR7Zm9ybWF0RGF0ZVRpbWUodGFzay51cGRhdGVkQXQpfWA7CiAgICBpZiAodGFzay5jb21wbGV0ZWRBdCkgbWV0YSArPSBgICAgfCAgIENvbXBsZXRlZDogJHtmb3JtYXREYXRlVGltZSh0YXNrLmNvbXBsZXRlZEF0KX1gOwogICAgY29uc3QgbWV0YUxpbmVzID0gZG9jLnNwbGl0VGV4dFRvU2l6ZShtZXRhLCBtYXhXaWR0aCk7CiAgICBkb2MudGV4dChtZXRhTGluZXMsIG1hcmdpbiwgeSk7CiAgICB5ICs9IG1ldGFMaW5lcy5sZW5ndGggKiAxMiArIDEwOwogIH0pOwoKICBpZiAoc29ydGVkLmxlbmd0aCA9PT0gMCkgewogICAgZG9jLnNldEZvbnRTaXplKDEyKTsKICAgIGRvYy5zZXRUZXh0Q29sb3IoMCk7CiAgICBkb2MudGV4dCgnTm8gdGFza3MgZm91bmQuJywgcGFnZVdpZHRoIC8gMiwgeSwgeyBhbGlnbjogJ2NlbnRlcicgfSk7CiAgfQoKICBkb2Muc2F2ZSgnZHV0eS1saXN0LXRhc2tzLnBkZicpOwp9Cjwvc2NyaXB0Pgo8c2NyaXB0PgovLyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KLy8gV2lyZSB1cCBkYXNoYm9hcmQgZXZlbnQgbGlzdGVuZXJzIChjYWxsZWQgb25jZSBwZXIgZGFzaGJvYXJkIHJlbmRlcikKLy8gLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCmZ1bmN0aW9uIHdpcmVEYXNoYm9hcmRFdmVudHMoKSB7CiAgLy8gVGhlbWUKICBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnYnRuLXRoZW1lJykuYWRkRXZlbnRMaXN0ZW5lcignY2xpY2snLCAoKSA9PiB7CiAgICB0b2dnbGVUaGVtZSgpOwogICAgcmVuZGVyRGFzaGJvYXJkKCk7CiAgfSk7CgogIC8vIFF1aWNrIGFkZAogIGNvbnN0IHF1aWNrQWRkID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3F1aWNrLWFkZC1pbnB1dCcpOwogIGNvbnN0IHF1aWNrQWRkVXJnZW50ID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3F1aWNrLWFkZC11cmdlbnQnKTsKICBjb25zdCBxdWlja0FkZER1ZURhdGUgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgncXVpY2stYWRkLWR1ZS1kYXRlJyk7CiAgcXVpY2tBZGRVcmdlbnQuYWRkRXZlbnRMaXN0ZW5lcignY2hhbmdlJywgKCkgPT4gewogICAgc3RhdGUucXVpY2tBZGRVcmdlbnQgPSBxdWlja0FkZFVyZ2VudC5jaGVja2VkOwogICAgcmVuZGVyUXVpY2tBZGRVcmdlbnRMYWJlbCgpOwogIH0pOwogIHF1aWNrQWRkLmFkZEV2ZW50TGlzdGVuZXIoJ2tleWRvd24nLCAoZSkgPT4gewogICAgaWYgKGUua2V5ID09PSAnRW50ZXInICYmICFlLnNoaWZ0S2V5KSB7CiAgICAgIGUucHJldmVudERlZmF1bHQoKTsKICAgICAgY29uc3QgdGV4dCA9IHF1aWNrQWRkLnZhbHVlOwogICAgICBpZiAoIXRleHQudHJpbSgpKSByZXR1cm47CiAgICAgIGNvbnN0IGxpbmVzID0gdGV4dC5zcGxpdCgnXG4nKS5maWx0ZXIoKGwpID0+IGwudHJpbSgpLmxlbmd0aCA+IDApOwogICAgICBsaW5lcy5mb3JFYWNoKChsaW5lKSA9PiBjcmVhdGVUYXNrKHsgdGFza05hbWU6IGxpbmUsIHN0YXR1czogJ3BlbmRpbmcnLCBpc1VyZ2VudDogc3RhdGUucXVpY2tBZGRVcmdlbnQsIGR1ZURhdGU6IHF1aWNrQWRkRHVlRGF0ZS52YWx1ZSB9KSk7CiAgICAgIHF1aWNrQWRkLnZhbHVlID0gJyc7CiAgICAgIHJlbmRlclN0YXRzKCk7CiAgICAgIHJlbmRlclRhc2tMaXN0KCk7CiAgICB9CiAgfSk7CgogIC8vIFNlYXJjaAogIGNvbnN0IHNlYXJjaElucHV0ID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3NlYXJjaC1pbnB1dCcpOwogIGNvbnN0IHNlYXJjaENsZWFyID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3NlYXJjaC1jbGVhcicpOwogIGNvbnN0IGRlYm91bmNlZFNlYXJjaCA9IGRlYm91bmNlKCgpID0+IHJlbmRlclRhc2tMaXN0KCksIDIwMCk7CiAgc2VhcmNoSW5wdXQuYWRkRXZlbnRMaXN0ZW5lcignaW5wdXQnLCAoKSA9PiB7CiAgICBzdGF0ZS5zZWFyY2ggPSBzZWFyY2hJbnB1dC52YWx1ZTsKICAgIHNlYXJjaENsZWFyLmNsYXNzTGlzdC50b2dnbGUoJ2hpZGRlbicsICFzdGF0ZS5zZWFyY2gpOwogICAgZGVib3VuY2VkU2VhcmNoKCk7CiAgfSk7CiAgc2VhcmNoQ2xlYXIuYWRkRXZlbnRMaXN0ZW5lcignY2xpY2snLCAoKSA9PiB7CiAgICBzdGF0ZS5zZWFyY2ggPSAnJzsKICAgIHNlYXJjaElucHV0LnZhbHVlID0gJyc7CiAgICBzZWFyY2hDbGVhci5jbGFzc0xpc3QuYWRkKCdoaWRkZW4nKTsKICAgIHJlbmRlclRhc2tMaXN0KCk7CiAgICBzZWFyY2hJbnB1dC5mb2N1cygpOwogIH0pOwoKICAvLyBUYXNrIGxpc3QgYWN0aW9ucyAoZXZlbnQgZGVsZWdhdGlvbikKICBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgndGFzay1saXN0LWNvbnRhaW5lcicpLmFkZEV2ZW50TGlzdGVuZXIoJ2NsaWNrJywgKGUpID0+IHsKICAgIGNvbnN0IGJ0biA9IGUudGFyZ2V0LmNsb3Nlc3QoJ1tkYXRhLWFjdGlvbl0nKTsKICAgIGlmICghYnRuKSByZXR1cm47CiAgICBjb25zdCB7IGFjdGlvbiwgaWQgfSA9IGJ0bi5kYXRhc2V0OwogICAgY29uc3QgdGFzayA9IGdldFRhc2tCeUlkKGlkKTsKICAgIGlmICghdGFzaykgcmV0dXJuOwoKICAgIHN0YXRlLmxhc3RUb3VjaGVkVGFza0lkID0gaWQ7CgogICAgaWYgKGFjdGlvbiA9PT0gJ3RvZ2dsZS1jb21wbGV0ZScpIHsKICAgICAgY29uc3Qgd2FzQ29tcGxldGVkID0gdGFzay5zdGF0dXMgPT09ICdjb21wbGV0ZWQnOwogICAgICB0b2dnbGVDb21wbGV0ZShpZCk7CiAgICAgIHJlbmRlclN0YXRzKCk7CiAgICAgIHJlbmRlclRhc2tMaXN0KCk7CiAgICAgIGlmICghd2FzQ29tcGxldGVkKSB7CiAgICAgICAgc2hvd1VuZG9Ub2FzdChgIiR7dGFzay50YXNrTmFtZX0iIG1hcmtlZCBjb21wbGV0ZSBhbmQgbW92ZWQgdG8gQXJjaGl2ZS5gLCAoKSA9PiB7CiAgICAgICAgICByZXN0b3JlRnJvbUFyY2hpdmUoaWQpOwogICAgICAgICAgcmVuZGVyU3RhdHMoKTsKICAgICAgICAgIHJlbmRlclRhc2tMaXN0KCk7CiAgICAgICAgfSk7CiAgICAgIH0KICAgIH0gZWxzZSBpZiAoYWN0aW9uID09PSAncmVzdG9yZScpIHsKICAgICAgcmVzdG9yZUZyb21BcmNoaXZlKGlkKTsKICAgICAgcmVuZGVyU3RhdHMoKTsKICAgICAgcmVuZGVyVGFza0xpc3QoKTsKICAgICAgc2hvd1RvYXN0KCdzdWNjZXNzJywgYCIke3Rhc2sudGFza05hbWV9IiByZXN0b3JlZCB0byBQZW5kaW5nLmApOwogICAgfSBlbHNlIGlmIChhY3Rpb24gPT09ICd0b2dnbGUtdXJnZW50JykgewogICAgICB0b2dnbGVVcmdlbnQoaWQpOwogICAgICByZW5kZXJTdGF0cygpOwogICAgICByZW5kZXJUYXNrTGlzdCgpOwogICAgfSBlbHNlIGlmIChhY3Rpb24gPT09ICdlZGl0JykgewogICAgICBvcGVuVGFza01vZGFsKGlkKTsKICAgIH0gZWxzZSBpZiAoYWN0aW9uID09PSAnZGVsZXRlJykgewogICAgICBpZiAod2luZG93LmNvbmZpcm0oYERlbGV0ZSB0YXNrICIke3Rhc2sudGFza05hbWV9Ij8gVGhpcyBjYW5ub3QgYmUgdW5kb25lLmApKSB7CiAgICAgICAgZGVsZXRlVGFzayhpZCk7CiAgICAgICAgcmVuZGVyU3RhdHMoKTsKICAgICAgICByZW5kZXJUYXNrTGlzdCgpOwogICAgICB9CiAgICB9CiAgfSk7CgogIC8vIEZpbGUgaW1wb3J0OiBkcm9wem9uZQogIGNvbnN0IGRyb3B6b25lID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2Ryb3B6b25lJyk7CiAgY29uc3QgZmlsZUlucHV0ID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2ZpbGUtaW5wdXQnKTsKICBjb25zdCBkcm9wem9uZVRleHQgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnZHJvcHpvbmUtdGV4dCcpOwoKICBkcm9wem9uZS5hZGRFdmVudExpc3RlbmVyKCdjbGljaycsICgpID0+IGZpbGVJbnB1dC5jbGljaygpKTsKICBmaWxlSW5wdXQuYWRkRXZlbnRMaXN0ZW5lcignY2hhbmdlJywgKCkgPT4gewogICAgaWYgKGZpbGVJbnB1dC5maWxlc1swXSkgaGFuZGxlSW1wb3J0RmlsZShmaWxlSW5wdXQuZmlsZXNbMF0pOwogICAgZmlsZUlucHV0LnZhbHVlID0gJyc7CiAgfSk7CiAgZHJvcHpvbmUuYWRkRXZlbnRMaXN0ZW5lcignZHJhZ292ZXInLCAoZSkgPT4gewogICAgZS5wcmV2ZW50RGVmYXVsdCgpOwogICAgZHJvcHpvbmUuY2xhc3NMaXN0LmFkZCgnYm9yZGVyLXByaW1hcnktNTAwJywgJ2JnLXByaW1hcnktNTAnLCAnZGFyazpiZy1wcmltYXJ5LTk1MC8zMCcpOwogIH0pOwogIGRyb3B6b25lLmFkZEV2ZW50TGlzdGVuZXIoJ2RyYWdsZWF2ZScsICgpID0+IHsKICAgIGRyb3B6b25lLmNsYXNzTGlzdC5yZW1vdmUoJ2JvcmRlci1wcmltYXJ5LTUwMCcsICdiZy1wcmltYXJ5LTUwJywgJ2Rhcms6YmctcHJpbWFyeS05NTAvMzAnKTsKICB9KTsKICBkcm9wem9uZS5hZGRFdmVudExpc3RlbmVyKCdkcm9wJywgKGUpID0+IHsKICAgIGUucHJldmVudERlZmF1bHQoKTsKICAgIGRyb3B6b25lLmNsYXNzTGlzdC5yZW1vdmUoJ2JvcmRlci1wcmltYXJ5LTUwMCcsICdiZy1wcmltYXJ5LTUwJywgJ2Rhcms6YmctcHJpbWFyeS05NTAvMzAnKTsKICAgIGlmIChlLmRhdGFUcmFuc2Zlci5maWxlc1swXSkgaGFuZGxlSW1wb3J0RmlsZShlLmRhdGFUcmFuc2Zlci5maWxlc1swXSk7CiAgfSk7CgogIC8vIEV4cG9ydAogIGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdleHBvcnQtZXhjZWwnKS5hZGRFdmVudExpc3RlbmVyKCdjbGljaycsIGV4cG9ydEV4Y2VsKTsKICBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnZXhwb3J0LXBkZicpLmFkZEV2ZW50TGlzdGVuZXIoJ2NsaWNrJywgZXhwb3J0UERGKTsKfQoKLy8gLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCi8vIEdsb2JhbCBrZXlib2FyZCBzaG9ydGN1dHMKLy8gLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCndpbmRvdy5hZGRFdmVudExpc3RlbmVyKCdrZXlkb3duJywgKGUpID0+IHsKICBpZiAoZS5rZXkgPT09ICdFc2NhcGUnKSB7CiAgICBpZiAoc3RhdGUuZWRpdGluZ1Rhc2tJZCAhPT0gbnVsbCkgY2xvc2VUYXNrTW9kYWwoKTsKICAgIHJldHVybjsKICB9CgogIC8vIEN0cmwrTjogZm9jdXMgcXVpY2sgYWRkIChuZXcgdGFzaykKICBpZiAoKGUuY3RybEtleSB8fCBlLm1ldGFLZXkpICYmIGUua2V5LnRvTG93ZXJDYXNlKCkgPT09ICduJykgewogICAgZS5wcmV2ZW50RGVmYXVsdCgpOwogICAgY29uc3QgZWwgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgncXVpY2stYWRkLWlucHV0Jyk7CiAgICBpZiAoZWwpIGVsLmZvY3VzKCk7CiAgICByZXR1cm47CiAgfQoKICAvLyBDdHJsK1U6IHRvZ2dsZSB1cmdlbnQgb24gdGhlIG1vc3QgcmVjZW50bHkgdG91Y2hlZCAvIGZpcnN0IHZpc2libGUgdGFzawogIGlmICgoZS5jdHJsS2V5IHx8IGUubWV0YUtleSkgJiYgZS5rZXkudG9Mb3dlckNhc2UoKSA9PT0gJ3UnKSB7CiAgICBlLnByZXZlbnREZWZhdWx0KCk7CiAgICBjb25zdCB0YXJnZXRJZCA9IHN0YXRlLmxhc3RUb3VjaGVkVGFza0lkICYmIGdldFRhc2tCeUlkKHN0YXRlLmxhc3RUb3VjaGVkVGFza0lkKQogICAgICA/IHN0YXRlLmxhc3RUb3VjaGVkVGFza0lkCiAgICAgIDogKGdldEZpbHRlcmVkU29ydGVkVGFza3MoKVswXSAmJiBnZXRGaWx0ZXJlZFNvcnRlZFRhc2tzKClbMF0uaWQpOwogICAgaWYgKHRhcmdldElkKSB7CiAgICAgIHRvZ2dsZVVyZ2VudCh0YXJnZXRJZCk7CiAgICAgIHJlbmRlclN0YXRzKCk7CiAgICAgIHJlbmRlclRhc2tMaXN0KCk7CiAgICAgIGNvbnN0IHRhc2sgPSBnZXRUYXNrQnlJZCh0YXJnZXRJZCk7CiAgICAgIGlmICh0YXNrKSBzaG93VG9hc3QoJ3N1Y2Nlc3MnLCBgIiR7dGFzay50YXNrTmFtZX0iIHVyZ2VudCBmbGFnICR7dGFzay5pc1VyZ2VudCA/ICdzZXQnIDogJ3JlbW92ZWQnfS5gKTsKICAgIH0KICAgIHJldHVybjsKICB9CgogIGNvbnN0IHRhZyA9IGRvY3VtZW50LmFjdGl2ZUVsZW1lbnQgJiYgZG9jdW1lbnQuYWN0aXZlRWxlbWVudC50YWdOYW1lOwogIGNvbnN0IGlzVHlwaW5nID0gdGFnID09PSAnSU5QVVQnIHx8IHRhZyA9PT0gJ1RFWFRBUkVBJzsKICBpZiAoaXNUeXBpbmcpIHJldHVybjsKCiAgaWYgKGUua2V5ID09PSAnLycpIHsKICAgIGUucHJldmVudERlZmF1bHQoKTsKICAgIGNvbnN0IGVsID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3NlYXJjaC1pbnB1dCcpOwogICAgaWYgKGVsKSBlbC5mb2N1cygpOwogIH0KfSk7CgovLyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KLy8gSW5pdAovLyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KZG9jdW1lbnQuYWRkRXZlbnRMaXN0ZW5lcignRE9NQ29udGVudExvYWRlZCcsIHJlbmRlcik7Cjwvc2NyaXB0Pgo8L2JvZHk+CjwvaHRtbD4K");
+  const bytes=Uint8Array.from(html, c=>c.charCodeAt(0));
+  const decoded=new TextDecoder("utf-8").decode(bytes);
+  frame.srcdoc=decoded;
+  personalTasksLoaded=true;
+    }
+  } else {
+    document.getElementById('personal-tasks-sumudu').style.display='none';
+    document.getElementById('personal-tasks-officer').style.display='';
+    markOverduePersonalTasks();
+    renderPersonalTasks();
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+// RECYCLE BIN
+// ═══════════════════════════════════════════════════════
+function renderRecycle(){
+  const tbody=document.getElementById('recycle-tbody');
+  if(!DB.recycleBin.length){ tbody.innerHTML=`<tr><td colspan="5"><div class="empty-state"><div class="empty-icon">📦</div><p>No archived tasks</p></div></td></tr>`; return; }
+  tbody.innerHTML=DB.recycleBin.map((t,i)=>`
+    <tr class="deleted-task-row">
+      <td><div class="task-title-cell"><div class="title">${escHtml(t.title)}</div><div class="desc">${escHtml(t.description||'')}</div></div></td>
+      <td>${USERS[t.assignedTo]?.name||t.assignedTo}</td>
+      <td>${USERS[t.deletedBy]?.name||t.deletedBy}</td>
+      <td style="font-weight:500">${t.deletedDate?new Date(t.deletedDate).toLocaleDateString():''}</td>
+      <td>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn-success btn-sm" onclick="restoreTask(${i})">Restore</button>
+          <button class="btn btn-danger btn-sm" onclick="permDelete(${i})">Delete</button>
+        </div>
+      </td>
+    </tr>`).join('');
+}
+
+async function restoreTask(i){
+  const t=DB.recycleBin.splice(i,1)[0];
+  const rid=t.id;
+  delete t.deletedBy; delete t.deletedDate;
+  t.status='Pending';
+  DB.tasks.push(t);
+  await dbDeleteRecycleBin(rid);
+  await dbInsertTask(t);
+  showToast('Task restored','success');
+  renderRecycle();
+}
+
+async function permDelete(i){
+  if(!confirm('Permanently delete this task? This cannot be undone.')) return;
+  const t=DB.recycleBin.splice(i,1)[0];
+  await dbDeleteRecycleBin(t.id);
+  showToast('Task permanently deleted','warning');
+  renderRecycle();
+}
+
+// ═══════════════════════════════════════════════════════
+// REPORTS
+// ═══════════════════════════════════════════════════════
+function renderReports(){
+  const isDark=document.documentElement.getAttribute('data-theme')==='dark';
+  const textColor=isDark?'#9499b3':'#5c5f77';
+  const gridColor=isDark?'#2a2b3d':'#e4e7ef';
+  const fontOpts={size:12,weight:'500',family:'Inter'};
+
+  destroyChart('chart-productivity');
+  const names=['Dev','Mitiksha'];
+  const deTasks=DB.tasks.filter(t=>t.assignedTo==='de');
+  const miTasks=DB.tasks.filter(t=>t.assignedTo==='mitiksha');
+  charts['chart-productivity']=new Chart(document.getElementById('chart-productivity'),{
+    type:'bar',
+    data:{ labels:names, datasets:[
+      {label:'Assigned',data:[deTasks.length,miTasks.length],backgroundColor:isDark?'#6366f1':'#6366f1cc',borderRadius:6,borderSkipped:false},
+      {label:'Completed',data:[deTasks.filter(t=>t.status==='Completed').length,miTasks.filter(t=>t.status==='Completed').length],backgroundColor:isDark?'#22c55e':'#22c55ecc',borderRadius:6,borderSkipped:false}
+    ]},
+    options:{ responsive:true,maintainAspectRatio:false, plugins:{legend:{labels:{color:textColor,font:fontOpts,usePointStyle:true,pointStyleWidth:8}}}, scales:{x:{ticks:{color:textColor,font:fontOpts},grid:{display:false}},y:{ticks:{color:textColor,font:fontOpts},grid:{color:gridColor},border:{dash:[4,4]}}} }
+  });
+
+  destroyChart('chart-ontime');
+  const allDone=DB.tasks.filter(t=>t.status==='Completed');
+  const onTime=allDone.filter(t=>t.completionDate<=t.deadlineDate).length;
+  const late=allDone.length-onTime;
+  charts['chart-ontime']=new Chart(document.getElementById('chart-ontime'),{
+    type:'doughnut',
+    data:{ labels:['On Time','Late'],datasets:[{data:[onTime,late],backgroundColor:['#22c55e','#ef4444'],borderWidth:0,borderRadius:4}]},
+    options:{responsive:true,maintainAspectRatio:false,cutout:'70%',plugins:{legend:{labels:{color:textColor,font:fontOpts,usePointStyle:true,pointStyleWidth:8}}}}
+  });
+
+  destroyChart('chart-daily');
+  const now2=new Date();
+  const daysInM=new Date(now2.getFullYear(),now2.getMonth()+1,0).getDate();
+  const dayLabels=[];
+  const devCompleted=[], devOverdue=[], mitCompleted=[], mitOverdue=[];
+  for(let d=1;d<=daysInM;d++){
+    const ds=`${now2.getFullYear()}-${String(now2.getMonth()+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+    dayLabels.push(d);
+    const snap=DB.dailySummary[ds]||{};
+    const dSnap=snap['de']||{completed_count:0,overdue_count:0};
+    const mSnap=snap['mitiksha']||{completed_count:0,overdue_count:0};
+    devCompleted.push(dSnap.completed_count);
+    devOverdue.push(dSnap.overdue_count);
+    mitCompleted.push(mSnap.completed_count);
+    mitOverdue.push(mSnap.overdue_count);
+  }
+  charts['chart-daily']=new Chart(document.getElementById('chart-daily'),{
+    type:'bar',
+    data:{ labels:dayLabels, datasets:[
+      {label:'Dev — Completed',data:devCompleted,backgroundColor:'#3b82f6',borderRadius:4,borderSkipped:false,stack:'dev'},
+      {label:'Dev — Overdue',data:devOverdue,backgroundColor:'#93c5fd',borderRadius:4,borderSkipped:false,stack:'dev'},
+      {label:'Mitiksha — Completed',data:mitCompleted,backgroundColor:'#22c55e',borderRadius:4,borderSkipped:false,stack:'mit'},
+      {label:'Mitiksha — Overdue',data:mitOverdue,backgroundColor:'#f87171',borderRadius:4,borderSkipped:false,stack:'mit'}
+    ]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:textColor,font:fontOpts,usePointStyle:true,pointStyleWidth:8}}},scales:{x:{stacked:true,ticks:{color:textColor,font:fontOpts},grid:{display:false}},y:{stacked:true,ticks:{color:textColor,font:fontOpts,stepSize:1},grid:{color:gridColor},border:{dash:[4,4]}}}}
+  });
+}
+
+// ═══════════════════════════════════════════════════════
+// EXCEL IMPORT/EXPORT
+// ═══════════════════════════════════════════════════════
+function exportExcel(){
+  const tasks=DB.tasks;
+  const rows=[['ID','Title','Description','Assigned To','Assigned By','Assigned Date','Deadline','Priority','Status','Completion Date','Link','Recurring']];
+  tasks.forEach(t=>rows.push([t.id,t.title,t.description||'',USERS[t.assignedTo]?.name||t.assignedTo,USERS[t.assignedBy]?.name||t.assignedBy,t.assignedDate,t.deadlineDate,t.priority,t.status,t.completionDate||'',t.externalLink||'',t.isRecurring?t.recurrenceType:'No']));
+  const ws=XLSX.utils.aoa_to_sheet(rows);
+  const wb=XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb,ws,'Tasks');
+  XLSX.writeFile(wb,'FinanceFlow_Tasks.xlsx');
+  showToast('Tasks exported to Excel','success');
+}
+
+function importExcel(event){
+  const file=event.target.files[0];
+  if(!file) return;
+  const reader=new FileReader();
+  reader.onload=e=>{
+    try{
+      const wb=XLSX.read(e.target.result,{type:'binary'});
+      const ws=wb.Sheets[wb.SheetNames[0]];
+      const data=XLSX.utils.sheet_to_json(ws,{header:1});
+      let imported=0;
+      data.slice(1).forEach(row=>{
+        if(!row[0]) return;
+        const assignTo=Object.keys(USERS).find(k=>USERS[k].name.toLowerCase()===String(row[3]||'').toLowerCase())||'de';
+        const task={
+          id:'task_'+Date.now()+Math.random(),
+          title:String(row[0]||'Untitled'),
+          description:String(row[1]||''),
+          assignedTo:assignTo,
+          assignedBy:currentUser,
+          assignedDate:row[2]?String(row[2]):today(),
+          deadlineDate:row[4]?String(row[4]):today(),
+          priority:'Urgent',
+          status:'Pending',
+          externalLink:'',
+          isRecurring:false,
+          recurrenceType:'',
+          completionDate:null,
+          createdDate:new Date().toISOString(),
+          updatedDate:new Date().toISOString(),
+          steps:[],attachments:[]
+        };
+        DB.tasks.push(task);
+        imported++;
+      });
+      saveDB();
+      showToast(`${imported} tasks imported from Excel`,'success');
+      renderTasks(); renderDashboard();
+    }catch(err){ showToast('Error reading Excel file','error'); }
+  };
+  reader.readAsBinaryString(file);
+  event.target.value='';
+}
+
+// ═══════════════════════════════════════════════════════
+// MODAL
+// ═══════════════════════════════════════════════════════
+function openModal(title,body,btns=[]){
+  document.getElementById('modal-title').textContent=title;
+  document.getElementById('modal-body').innerHTML=body;
+  const footer=document.getElementById('modal-footer');
+  footer.innerHTML=btns.map(b=>`<button class="btn ${b.cls}" onclick="${b.action}">${b.label}</button>`).join('');
+  document.getElementById('modal-overlay').classList.remove('hidden');
+  document.body.style.overflow='hidden';
+  pendingFiles=[];
+}
+
+function closeModal(e){
+  if(e && e.target && e.target!==document.getElementById('modal-overlay')) return;
+  document.getElementById('modal-overlay').classList.add('hidden');
+  document.body.style.overflow='';
+  pendingFiles=[];
+}
+
+// ═══════════════════════════════════════════════════════
+// TOAST
+// ═══════════════════════════════════════════════════════
+function showToast(msg,type='info'){
+  const c=document.getElementById('toast-container');
+  const t=document.createElement('div');
+  t.className=`toast ${type}`;
+  const icons={success:'✅',error:'❌',warning:'⚠️',info:'ℹ️'};
+  t.innerHTML=`<span>${icons[type]||'ℹ️'}</span><span>${msg}</span>`;
+  c.appendChild(t);
+  setTimeout(()=>{ t.style.animation='toastOut .3s ease forwards'; setTimeout(()=>t.remove(),300); },4000);
+}
+
+// ═══════════════════════════════════════════════════════
+// DASHBOARD STAT CLICK
+// ═══════════════════════════════════════════════════════
+function dashStatClick(statusFilter){
+  if(currentUser==='sumudu'||currentUser==='de'){
+    navigateTo('tasks');
+    if(statusFilter){ document.getElementById('filter-status').value=statusFilter; renderTasks(); }
+  } else {
+    navigateTo('my-tasks');
+    if(statusFilter){ document.getElementById('my-filter-status').value=statusFilter; renderMyTasks(); }
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+// EMAILJS SETUP
+// ═══════════════════════════════════════════════════════
+emailjs.init('cr7Jzs6awXDeCUUNa');
+const EMAILJS_SERVICE='service_82awixe';
+const EMAILJS_TEMPLATE='template_2wqz252';
+
+function htmlToPlainText(html){
+  const tmp = document.createElement('div');
+  tmp.innerHTML = html
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<\/tr>/gi, '\n')
+    .replace(/<th[^>]*>/gi, '')
+    .replace(/<\/th>/gi, ': ')
+    .replace(/<td[^>]*>/gi, '')
+    .replace(/<\/td>/gi, '\n')
+    .replace(/<[^>]+>/g, '');
+  let text = tmp.textContent || tmp.innerText || '';
+  return text.replace(/\n{3,}/g, '\n\n').trim();
+}
+
+async function sendRealEmail(to, subject, body){
+  try{
+    const plainBody = htmlToPlainText(body);
+    const res = await emailjs.send(EMAILJS_SERVICE, EMAILJS_TEMPLATE, {
+      to_email: to,
+      subject: subject,
+      message: plainBody,
+      body: plainBody,
+      from_name: 'FinanceFlow',
+      reply_to: 'noreply@financeflow.com'
+    });
+    console.log('EmailJS success:', res);
+    return true;
+  }catch(err){
+    console.error('EmailJS error:', err);
+    showToast('❌ Email error: ' + (err.text || err.message || JSON.stringify(err)), 'error');
+    return false;
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+// EMAIL NOTIFICATION SYSTEM
+// ═══════════════════════════════════════════════════════
+async function simulateEmail(type, task){
+  let subject='', to='', body='';
+  const assignee=USERS[task.assignedTo];
+  const assigner=USERS[task.assignedBy]||USERS[currentUser];
+
+  if(type==='doc_request'){
+    to=USERS['sumudu'].email;
+    subject=`📄 Document Request from ${USERS[task.assignedBy]?.name}: ${task.title}`;
+    body=`<p>Hi <strong>Sumudu</strong>,</p>
+      <p><strong>${USERS[task.assignedBy]?.name}</strong> has requested a document.</p>
+      <table><tr><th>Request</th><td>${escHtml(task.title)}</td></tr>
+      <tr><th>Date</th><td>${fmt(task.assignedDate)}</td></tr></table>
+      ${task.description?`<p><strong>Details:</strong> ${escHtml(task.description)}</p>`:''}
+      <p style="margin-top:14px;color:#6366f1;font-weight:600">— FinanceFlow Task Management</p>`;
+    const email={id:'em_'+Date.now(),type,subject,to,from:USERS[task.assignedBy]?.email||'system@financeflow.com',body,timestamp:new Date().toISOString(),taskId:task.id};
+    DB.emailLog.push(email);
+    await dbInsertEmail(email);
+    showEmailPreview(email);
+    const sent=await sendRealEmail(to, subject, body);
+    showToast(sent?`📧 Request emailed to Sumudu`:'📧 Request logged (email delivery pending)','success');
+    return;
+  }
+
+  if(type==='new_task'){
+    to=assignee.email;
+    subject=`New Task Assigned: ${task.title}`;
+    body=`<p>Hi <strong>${assignee.name}</strong>,</p>
+      <p>A new task has been assigned to you by <strong>${assigner.name}</strong>.</p>
+      <table><tr><th>Task</th><td>${escHtml(task.title)}</td></tr>
+      <tr><th>Priority</th><td>${task.priority}${task.urgentFlag?' 🔴':''}</td></tr>
+      <tr><th>Assigned</th><td>${fmt(task.assignedDate)}</td></tr>
+      <tr><th>Deadline</th><td>${fmt(task.deadlineDate)}</td></tr>
+      <tr><th>Status</th><td>${task.status}</td></tr></table>
+      ${task.description?`<p><strong>Details:</strong> ${escHtml(task.description)}</p>`:''}
+      ${task.externalLink?`<p><strong>Link:</strong> <a href="${sanitizeUrl(task.externalLink)}">${escHtml(task.externalLink)}</a></p>`:''}
+      <p style="margin-top:14px;color:#6366f1;font-weight:600">— FinanceFlow Task Management</p>`;
+  }
+
+  const email={id:'em_'+Date.now(),type,subject,to,from:assigner?.email||'system@financeflow.com',body,timestamp:new Date().toISOString(),taskId:task.id};
+  DB.emailLog.push(email);
+  await dbInsertEmail(email);
+  showEmailPreview(email);
+  const sent=await sendRealEmail(to, subject, body);
+  showToast(sent?`📧 Email sent to ${assignee.name}`:`📧 Logged (email delivery pending)`,'success');
+}
+
+function showEmailPreview(email){
+  const body=`<div class="email-preview">
+    <div class="email-header">
+      <div class="email-row"><span class="email-label">From</span><span class="email-val">${escHtml(email.from)}</span></div>
+      <div class="email-row"><span class="email-label">To</span><span class="email-val">${escHtml(email.to)}</span></div>
+      <div class="email-row"><span class="email-label">Subject</span><span class="email-val" style="font-weight:700">${escHtml(email.subject)}</span></div>
+      <div class="email-row"><span class="email-label">Date</span><span class="email-val">${new Date(email.timestamp).toLocaleString()}</span></div>
+    </div>
+    <div class="email-body">${email.body}</div>
+  </div>`;
+  openModal('📧 Email Preview', body, [{label:'Close',action:'closeModal()',cls:'btn-secondary'}]);
+}
+
+async function sendMorningSummary(){
+  const employees = currentUser==='sumudu'?['de','mitiksha']:[currentUser];
+  for(const uid of employees){
+    const u=USERS[uid];
+    const tasks=DB.tasks.filter(t=>t.assignedTo===uid && t.status!=='Completed');
+    if(!tasks.length) return;
+    const subject=`☀️ Good Morning ${u.name} — Your Tasks for Today`;
+    const rows=tasks.map(t=>`<tr><td>${escHtml(t.title)}</td><td>${t.priority}${t.urgentFlag?' 🔴':''}</td><td>${t.status}</td><td>${fmt(t.deadlineDate)}</td></tr>`).join('');
+    const body=`<p>Hi <strong>${u.name}</strong>,</p>
+      <p>Here's your task summary for today. You have <strong>${tasks.length}</strong> pending task(s).</p>
+      <table><tr><th>Task</th><th>Priority</th><th>Status</th><th>Deadline</th></tr>${rows}</table>
+      <p>Have a productive day! 💪</p>
+      <p style="margin-top:14px;color:#6366f1;font-weight:600">— FinanceFlow Task Management</p>`;
+    const email={id:'em_'+Date.now()+Math.random(),type:'morning_summary',subject,to:u.email,from:'system@financeflow.com',body,timestamp:new Date().toISOString()};
+    DB.emailLog.push(email);
+    await dbInsertEmail(email);
+    await sendRealEmail(u.email, subject, body);
+  }
+  showToast('📬 Morning summary emails sent!','success');
+  if(document.getElementById('page-emails')?.classList.contains('active')) renderEmailLog();
+}
+
+async function sendEODSummary(){
+  const employees = currentUser==='sumudu'?['de','mitiksha']:[currentUser];
+  for(const uid of employees){
+    const u=USERS[uid];
+    const allTasks=DB.tasks.filter(t=>t.assignedTo===uid);
+    const done=allTasks.filter(t=>t.status==='Completed');
+    const pending=allTasks.filter(t=>t.status!=='Completed');
+    const overdue=allTasks.filter(t=>t.status==='Overdue');
+    const subject=`🌙 End of Day Summary — ${u.name}`;
+    const body=`<p>Hi <strong>${u.name}</strong>,</p>
+      <p>Here's your end-of-day summary:</p>
+      <table><tr><th>Metric</th><th>Count</th></tr>
+      <tr><td>Total Tasks</td><td><strong>${allTasks.length}</strong></td></tr>
+      <tr><td>Completed</td><td style="color:#22c55e"><strong>${done.length}</strong></td></tr>
+      <tr><td>Pending</td><td style="color:#f59e0b"><strong>${pending.length}</strong></td></tr>
+      <tr><td>Overdue</td><td style="color:#ef4444"><strong>${overdue.length}</strong></td></tr></table>
+      ${overdue.length?`<p style="color:#ef4444"><strong>⚠️ You have ${overdue.length} overdue task(s). Please prioritize them.</strong></p>`:''}
+      <p>Great work today! Rest well. 🌟</p>
+      <p style="margin-top:14px;color:#6366f1;font-weight:600">— FinanceFlow Task Management</p>`;
+    const email={id:'em_'+Date.now()+Math.random(),type:'eod_summary',subject,to:u.email,from:'system@financeflow.com',body,timestamp:new Date().toISOString()};
+    DB.emailLog.push(email);
+    await dbInsertEmail(email);
+    await sendRealEmail(u.email, subject, body);
+  }
+  showToast('📮 End-of-day summary emails sent!','success');
+  if(document.getElementById('page-emails')?.classList.contains('active')) renderEmailLog();
+}
+
+function renderEmailLog(){
+  const el=document.getElementById('email-log-list');
+  if(!el) return;
+  const emails=[...(DB.emailLog||[])].reverse();
+  if(!emails.length){ el.innerHTML=`<div class="empty-state"><div class="empty-icon">📧</div><p>No emails sent yet</p></div>`; return; }
+  el.innerHTML=emails.map(e=>`
+    <div class="email-log-item" onclick="viewEmailById('${e.id}')" style="cursor:pointer">
+      <div class="email-log-icon">${e.type==='new_task'?'📋':e.type==='morning_summary'||e.type==='morning_report'?'☀️':e.type==='due_warning'?'⚠️':'🌙'}</div>
+      <div class="email-log-info">
+        <div class="email-log-subject">${escHtml(e.subject)}</div>
+        <div class="email-log-to">To: ${escHtml(e.to)}</div>
+      </div>
+      <div class="email-log-time">${new Date(e.timestamp).toLocaleString()}</div>
+    </div>`).join('');
+}
+
+function viewEmailById(id){
+  const e=(DB.emailLog||[]).find(x=>x.id===id);
+  if(e) showEmailPreview(e);
+}
+
+
+let morningReportSent=localStorage.getItem('ffMorningReport_'+today())==='1';
+let dueWarningsSent=localStorage.getItem('ffDueWarnings_'+today())==='1';
+
+function checkAutoMorningReport(){
+  if(!canWrite()) return; // sending/logging the report is a write; skip for view-only users
+  const now=new Date();
+  const hour=now.getHours();
+  const min=now.getMinutes();
+  if(hour===7 && min<15 && !morningReportSent){
+    morningReportSent=true;
+    localStorage.setItem('ffMorningReport_'+today(),'1');
+    sendAutoMorningReport();
+  }
+  if(hour>=9 && !dueWarningsSent){
+    dueWarningsSent=true;
+    localStorage.setItem('ffDueWarnings_'+today(),'1');
+    sendDueDateWarnings();
+  }
+}
+
+async function sendAutoMorningReport(){
+  for(const uid of ['de','mitiksha']){
+    const u=USERS[uid];
+    const pending=DB.tasks.filter(t=>t.assignedTo===uid && (t.status==='Pending'||t.status==='In Progress'));
+    const due=DB.tasks.filter(t=>t.assignedTo===uid && t.status!=='Completed' && t.deadlineDate && t.deadlineDate<=today());
+    if(!pending.length && !due.length) continue;
+    const subject=`☀️ Morning Report — ${u.name} (${new Date().toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'})})`;
+    let rows='';
+    if(due.length){
+      rows+=`<tr><td colspan="4" style="background:#fee2e2;color:#dc2626;font-weight:700;padding:8px">⚠️ DUE / OVERDUE TASKS (${due.length})</td></tr>`;
+      rows+=due.map(t=>`<tr style="background:#fff5f5"><td>${escHtml(t.title)}</td><td>${t.priority}</td><td style="color:#dc2626;font-weight:600">${t.status}</td><td style="color:#dc2626">${fmt(t.deadlineDate)}</td></tr>`).join('');
+    }
+    if(pending.length){
+      rows+=`<tr><td colspan="4" style="background:#fef9c3;color:#92400e;font-weight:700;padding:8px">📋 PENDING TASKS (${pending.length})</td></tr>`;
+      rows+=pending.map(t=>`<tr><td>${escHtml(t.title)}</td><td>${t.priority}</td><td>${t.status}</td><td>${fmt(t.deadlineDate)}</td></tr>`).join('');
+    }
+    const body=`<p>Good Morning <strong>${u.name}</strong>,</p>
+      <p>Here is your daily task report:</p>
+      <table><tr><th>Task</th><th>Priority</th><th>Status</th><th>Deadline</th></tr>${rows}</table>
+      <p>Have a productive day! 💪</p>
+      <p style="margin-top:14px;color:#6366f1;font-weight:600">— FinanceFlow Task Management</p>`;
+    const email={id:'em_'+Date.now()+Math.random(),type:'morning_report',subject,to:u.email,from:'system@financeflow.com',body,timestamp:new Date().toISOString()};
+    DB.emailLog.push(email);
+    await dbInsertEmail(email);
+    await sendRealEmail(u.email, subject, body);
+  }
+}
+
+async function sendDueDateWarnings(){
+  const tomorrow=new Date();
+  tomorrow.setDate(tomorrow.getDate()+1);
+  const tomorrowStr=tomorrow.toISOString().split('T')[0];
+  for(const uid of ['de','mitiksha']){
+    const u=USERS[uid];
+    const approaching=DB.tasks.filter(t=>t.assignedTo===uid && t.status!=='Completed' && t.deadlineDate && (t.deadlineDate===today()||t.deadlineDate===tomorrowStr));
+    const overdue=DB.tasks.filter(t=>t.assignedTo===uid && t.status!=='Completed' && t.deadlineDate && t.deadlineDate<today());
+    const allWarning=[...overdue,...approaching];
+    if(!allWarning.length) continue;
+    const subject=`⚠️ Due Date Warning — ${allWarning.length} task(s) need attention`;
+    let rows=allWarning.map(t=>{
+      const isOD=t.deadlineDate<today();
+      return `<tr style="${isOD?'background:#fff5f5':'background:#fffbeb'}"><td>${escHtml(t.title)}</td><td style="color:${isOD?'#dc2626':'#f59e0b'};font-weight:600">${isOD?'OVERDUE':'Due '+fmt(t.deadlineDate)}</td><td>${fmt(t.deadlineDate)}</td></tr>`;
+    }).join('');
+    const body=`<p>Hi <strong>${u.name}</strong>,</p>
+      <p>The following tasks are approaching or have passed their due date:</p>
+      <table><tr><th>Task</th><th>Status</th><th>Deadline</th></tr>${rows}</table>
+      <p>Please prioritize these tasks.</p>
+      <p style="margin-top:14px;color:#6366f1;font-weight:600">— FinanceFlow Task Management</p>`;
+    const email={id:'em_'+Date.now()+Math.random(),type:'due_warning',subject,to:u.email,from:'system@financeflow.com',body,timestamp:new Date().toISOString()};
+    DB.emailLog.push(email);
+    await dbInsertEmail(email);
+    await sendRealEmail(u.email, subject, body);
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+// SEARCH
+// ═══════════════════════════════════════════════════════
+function globalSearch(q){
+  if(!q){ navigateTo('tasks'); return; }
+  q=q.toLowerCase();
+  const results=DB.tasks.filter(t=>
+    t.title.toLowerCase().includes(q)||
+    (t.description||'').toLowerCase().includes(q)||
+    (USERS[t.assignedTo]?.name||'').toLowerCase().includes(q)
+  );
+  navigateTo('tasks');
+  const tbody=document.getElementById('tasks-tbody');
+  if(!results.length){ tbody.innerHTML=`<tr><td colspan="8"><div class="empty-state"><div class="empty-icon">\u{1F50D}</div><p>No results for "${escHtml(q)}"</p></div></td></tr>`; return; }
+  tbody.innerHTML=results.map(t=>taskRow(t)).join('');
+}
+
+// ═══════════════════════════════════════════════════════
+// THEME
+// ═══════════════════════════════════════════════════════
+function toggleTheme(){
+  const curr=document.documentElement.getAttribute('data-theme');
+  const next=curr==='dark'?'light':'dark';
+  document.documentElement.setAttribute('data-theme',next);
+  localStorage.setItem('ffTheme',next);
+  setTimeout(()=>{ renderDashboard(); },100);
+}
+
+// ═══════════════════════════════════════════════════════
+// SIDEBAR MOBILE
+// ═══════════════════════════════════════════════════════
+function openSidebar(){ document.getElementById('sidebar').classList.add('open'); document.getElementById('sidebar-overlay').classList.add('open'); }
+function closeSidebar(){ document.getElementById('sidebar').classList.remove('open'); document.getElementById('sidebar-overlay').classList.remove('open'); }
+
+// ═══════════════════════════════════════════════════════
+// UTILS
+// ═══════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════
+// SIDEBAR CALENDAR
+// ═══════════════════════════════════════════════════════
+let calYear, calMonth;
+function initCalendar(){
+  const now=new Date();
+  calYear=now.getFullYear(); calMonth=now.getMonth();
+  renderCalendar();
+}
+function renderCalendar(){
+  const el=document.getElementById('sidebar-calendar');
+  if(!el) return;
+  const months=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const days=['Su','Mo','Tu','We','Th','Fr','Sa'];
+  const first=new Date(calYear,calMonth,1).getDay();
+  const daysInMonth=new Date(calYear,calMonth+1,0).getDate();
+  const todayStr=today();
+  const calTasks = currentUser==='mitiksha' ? DB.tasks.filter(t=>t.assignedTo==='mitiksha') : DB.tasks;
+  const taskDates=new Set(calTasks.map(t=>t.deadlineDate).filter(Boolean));
+  let grid=days.map(d=>`<div class="cal-day-name">${d}</div>`).join('');
+  for(let i=0;i<first;i++) grid+=`<div class="cal-day empty"></div>`;
+  for(let d=1;d<=daysInMonth;d++){
+    const dateStr=`${calYear}-${String(calMonth+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+    const isToday=dateStr===todayStr;
+    const hasTask=taskDates.has(dateStr);
+    grid+=`<div class="cal-day${isToday?' today':''}${hasTask?' has-task':''}" onclick="showCalDayTasks('${dateStr}')" style="cursor:pointer">${d}</div>`;
+  }
+  el.innerHTML=`<div class="cal-header">
+    <button onclick="calPrev()">&lsaquo;</button>
+    <span class="cal-title">${months[calMonth]} ${calYear}</span>
+    <button onclick="calNext()">&rsaquo;</button>
+  </div><div class="cal-grid">${grid}</div>`;
+}
+function calPrev(){ calMonth--; if(calMonth<0){calMonth=11;calYear--;} renderCalendar(); }
+function calNext(){ calMonth++; if(calMonth>11){calMonth=0;calYear++;} renderCalendar(); }
+function showCalDayTasks(dateStr){
+  let dayTasks=DB.tasks.filter(t=>t.deadlineDate===dateStr && t.status!=='Completed');
+  if(currentUser==='mitiksha') dayTasks=dayTasks.filter(t=>t.assignedTo==='mitiksha');
+  const d=new Date(dateStr+'T00:00:00');
+  const dateLabel=d.toLocaleDateString('en-GB',{weekday:'long',day:'2-digit',month:'short',year:'numeric'});
+  let body='';
+  if(!dayTasks.length){
+    body='<p style="color:var(--text3);text-align:center;padding:20px">No pending tasks on this date.</p>';
+  } else {
+    body=dayTasks.map(t=>`<div style="padding:10px 14px;border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;gap:10px;cursor:pointer" onclick="closeModal();viewTask('${t.id}')">
+      <div style="flex:1">
+        <div style="font-weight:600;font-size:13.5px">${t.urgentFlag?'🔴 ':''}${escHtml(t.title)}</div>
+        <div style="font-size:12px;color:var(--text3);margin-top:2px">${USERS[t.assignedTo]?.name||t.assignedTo} · ${statusBadge(t.status)}</div>
+      </div>
+    </div>`).join('');
+  }
+  openModal('📅 '+dateLabel, body, [{label:'Close',action:'closeModal()',cls:'btn-secondary'}]);
+}
+
+// ═══════════════════════════════════════════════════════
+// ROUTINE TASKS SYSTEM
+// ═══════════════════════════════════════════════════════
+let currentRoutineTab='daily';
+let showingRoutineArchive=false;
+
+function initRoutinePage(){
+  const isManager=currentUser==='sumudu';
+  showingRoutineArchive=false;
+  document.getElementById('routine-page-title').textContent='Team Routine Tasks';
+  document.getElementById('routine-header-actions').style.display='';
+  document.getElementById('routine-user-filter').style.display=isManager?'inline-block':'none';
+  document.getElementById('routine-export-btn').style.display=isManager?'inline-block':'none';
+  document.getElementById('routine-import-btn').style.display=isManager?'inline-flex':'none';
+  document.getElementById('routine-archive-view-btn').style.display='inline-block';
+  const addBtn=document.querySelector('#routine-header-actions button[onclick="showAddRoutineTask()"]');
+  if(addBtn) addBtn.style.display='inline-block';
+  checkAutoArchiveRoutines();
+  checkRoutineReappear();
+  ensureRoutineCompletions();
+  renderRoutineTasks();
+}
+
+function switchRoutineTab(tab){
+  currentRoutineTab=tab;
+  showingRoutineArchive=false;
+  ['daily','weekly','monthly','three_months'].forEach(t=>{
+    const btn=document.getElementById('routine-tab-'+t);
+    if(btn) btn.className='btn btn-sm '+(t===tab?'btn-primary':'btn-secondary');
+  });
+  renderRoutineTasks();
+}
+
+function toggleRoutineArchiveView(){
+  showingRoutineArchive=!showingRoutineArchive;
+  const btn=document.getElementById('routine-archive-view-btn');
+  if(btn) btn.textContent=showingRoutineArchive?'📋 Active Tasks':'📦 Archived';
+  renderRoutineTasks();
+}
+
+function getRoutineDueDate(frequency){
+  const now=new Date();
+  const d=now.toISOString().split('T')[0];
+  if(frequency==='daily') return d;
+  if(frequency==='weekly'){
+    const day=now.getDay();
+    const mon=new Date(now);
+    mon.setDate(now.getDate()-(day===0?6:day-1));
+    return mon.toISOString().split('T')[0];
+  }
+  if(frequency==='monthly') return d.substring(0,8)+'01';
+  if(frequency==='three_months'){
+    const q=Math.floor(now.getMonth()/3)*3;
+    return `${now.getFullYear()}-${String(q+1).padStart(2,'0')}-01`;
+  }
+  return d.substring(0,8)+'01';
+}
+
+function ensureRoutineCompletions(){
+  const activeTasks=DB.routineTasks.filter(t=>t.active && !t.archived);
+  for(const rt of activeTasks){
+    const dueDate=getRoutineDueDate(rt.frequency);
+    const exists=DB.routineCompletions.find(c=>c.taskId===rt.id && c.dueDate===dueDate);
+    if(!exists){
+      const comp={id:'rc_'+Date.now()+'_'+Math.random().toString(36).substr(2,5), taskId:rt.id, dueDate, completedAt:null, completedBy:null, status:'pending', deadlineDate:rt.deadlineDate||'', deadlineTime:rt.deadlineTime||'17:00', autoArchiveAt:null};
+      DB.routineCompletions.push(comp);
+      if(canWrite()) runDb(sb.from('ff_recurring_completions').insert({id:comp.id, task_id:comp.taskId, due_date:comp.dueDate, completed_at:null, completed_by:null, status:'pending', deadline_date:comp.deadlineDate, deadline_time:comp.deadlineTime, auto_archive_at:null}), 'create routine occurrence', {silent:true});
+    }
+  }
+  markOverdueRoutines();
+}
+
+function markOverdueRoutines(){
+  const now=new Date();
+  for(const comp of DB.routineCompletions){
+    if(comp.status!=='pending') continue;
+    const rt=DB.routineTasks.find(t=>t.id===comp.taskId);
+    if(!rt) continue;
+    if(rt.deadlineDate){
+      const dl=new Date(rt.deadlineDate+'T'+(rt.deadlineTime||'17:00'));
+      if(now>=dl && comp.status==='pending'){
+        comp.status='urgent';
+      }
+    }
+  }
+}
+
+function canModifyRoutineTask(rt){
+  if(currentUser==='sumudu') return true;
+  if(currentUser==='de') return true;
+  if(currentUser==='mitiksha' && rt.assignedTo==='mitiksha') return true;
+  if(currentUser==='mitiksha' && rt.createdBy==='mitiksha') return true;
+  return false;
+}
+
+function canCompleteRoutineTask(rt){
+  if(currentUser==='sumudu') return false;
+  if(currentUser==='de') return true;
+  if(currentUser==='mitiksha' && rt.assignedTo==='mitiksha') return true;
+  return false;
+}
+
+function checkAutoArchiveRoutines(){
+  const now=new Date();
+  DB.routineCompletions.forEach(comp=>{
+    if(comp.status==='completed' && comp.autoArchiveAt && !comp._archived){
+      const archiveTime=new Date(comp.autoArchiveAt);
+      if(now>=archiveTime){
+        comp._archived=true;
+      }
+    }
+  });
+}
+
+function checkRoutineReappear(){
+  const now=new Date();
+  const activeTasks=DB.routineTasks.filter(t=>t.active && !t.archived);
+  for(const rt of activeTasks){
+    const hasPending=DB.routineCompletions.find(c=>c.taskId===rt.id && (c.status==='pending'||c.status==='urgent') && !c._archived);
+    if(hasPending) continue;
+    const lastComp=DB.routineCompletions.filter(c=>c.taskId===rt.id && c.status==='completed').sort((a,b)=>new Date(b.completedAt)-new Date(a.completedAt))[0];
+    if(!lastComp) continue;
+    let shouldReappear=false;
+    let newDeadline='';
+    let newDue='';
+    let newDeadlineTime=rt.deadlineTime||'17:00';
+
+    if(rt.frequency==='daily'){
+      const compDate=new Date(lastComp.completedAt);
+      const reappearTime=new Date(compDate);
+      reappearTime.setHours(20,0,0,0);
+      if(now>=reappearTime || now.toISOString().split('T')[0]>lastComp.dueDate){
+        shouldReappear=true;
+        const tomorrow=new Date(now); tomorrow.setDate(tomorrow.getDate()+1);
+        newDeadline=tomorrow.toISOString().split('T')[0];
+        newDue=now.toISOString().split('T')[0];
+      }
+    } else if(rt.frequency==='weekly'){
+      const day=now.getDay();
+      const mon=new Date(now);
+      mon.setDate(now.getDate()-(day===0?6:day-1));
+      mon.setHours(7,0,0,0);
+      if(now>=mon && lastComp.dueDate<mon.toISOString().split('T')[0]){
+        shouldReappear=true;
+        const fri=new Date(mon); fri.setDate(fri.getDate()+4);
+        newDeadline=fri.toISOString().split('T')[0];
+        newDue=mon.toISOString().split('T')[0];
+      }
+    } else if(rt.frequency==='monthly'){
+      const curYear=now.getFullYear(), curMonth=now.getMonth();
+      const day28=new Date(curYear, curMonth, 28, 7, 0, 0);
+      const monthStart=now.toISOString().split('T')[0].substring(0,8)+'01';
+      if(lastComp.dueDate<monthStart && (now>=day28 || now.getDate()>=28)){
+        const lastDay=new Date(curYear, curMonth+1, 0).getDate();
+        newDeadline=`${curYear}-${String(curMonth+1).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
+        newDue=monthStart;
+        shouldReappear=true;
+      }
+    } else if(rt.frequency==='three_months'){
+      const curQ=Math.floor(now.getMonth()/3);
+      const qStart=`${now.getFullYear()}-${String(curQ*3+1).padStart(2,'0')}-01`;
+      if(lastComp.dueDate<qStart){
+        const m=curQ*3;
+        const lastDay=new Date(now.getFullYear(),m+3,0).getDate();
+        newDeadline=`${now.getFullYear()}-${String(m+3).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
+        newDue=qStart;
+        shouldReappear=true;
+      }
+    }
+    if(shouldReappear && newDue){
+      const alreadyExists=DB.routineCompletions.find(c=>c.taskId===rt.id && c.dueDate===newDue && (c.status==='pending'||c.status==='urgent'));
+      if(!alreadyExists){
+        const comp={id:'rc_'+Date.now()+'_'+Math.random().toString(36).substr(2,5), taskId:rt.id, dueDate:newDue, completedAt:null, completedBy:null, status:'pending', deadlineDate:newDeadline||rt.deadlineDate||'', deadlineTime:newDeadlineTime, autoArchiveAt:null};
+        DB.routineCompletions.push(comp);
+        if(canWrite()) runDb(sb.from('ff_recurring_completions').insert({id:comp.id, task_id:comp.taskId, due_date:comp.dueDate, completed_at:null, completed_by:null, status:'pending', deadline_date:comp.deadlineDate, deadline_time:comp.deadlineTime, auto_archive_at:null}), 'reappear routine occurrence', {silent:true});
+      }
+    }
+  }
+}
+
+function renderRoutineTasks(){
+  const el=document.getElementById('routine-tasks-content');
+  if(!el) return;
+  if(showingRoutineArchive) return renderArchivedRoutines(el);
+  const isManager=currentUser==='sumudu';
+  const filterUser=isManager?(document.getElementById('routine-user-filter')?.value||'all'):null;
+
+  let tasks=DB.routineTasks.filter(t=>t.active && !t.archived && t.frequency===currentRoutineTab);
+  if(currentUser==='de'||currentUser==='mitiksha') tasks=tasks.filter(t=>t.assignedTo===currentUser);
+  if(isManager && filterUser!=='all') tasks=tasks.filter(t=>t.assignedTo===filterUser);
+
+  if(!tasks.length){
+    el.innerHTML=`<div class="empty-state"><div class="empty-icon">🔄</div><p>No ${currentRoutineTab} routine tasks yet</p></div>`;
+    return;
+  }
+
+  const dueDate=getRoutineDueDate(currentRoutineTab);
+  const periodLabel=currentRoutineTab==='daily'?'Today':currentRoutineTab==='weekly'?'This Week':currentRoutineTab==='three_months'?'This Quarter':'This Month';
+
+  let taskRows=[];
+  for(const rt of tasks){
+    let comp=DB.routineCompletions.find(c=>c.taskId===rt.id && c.dueDate===dueDate);
+    if(!comp) comp=DB.routineCompletions.filter(c=>c.taskId===rt.id && !c._archived).sort((a,b)=>b.dueDate.localeCompare(a.dueDate))[0];
+    const status=comp?comp.status:'pending';
+    const isDone=status==='completed';
+    const isUrgent=status==='urgent';
+    const isOD=status==='overdue';
+    const dlDate=comp?.deadlineDate||rt.deadlineDate||'';
+    const dlTime=comp?.deadlineTime||rt.deadlineTime||'17:00';
+    const dlDisplay=dlDate?`${new Date(dlDate+'T'+dlTime).toLocaleDateString('en-GB',{day:'2-digit',month:'short'})} ${dlTime}`:'—';
+
+    let urgentNow=false;
+    if(!isDone && dlDate){
+      const dl=new Date(dlDate+'T'+dlTime);
+      if(new Date()>=dl) urgentNow=true;
+    }
+
+    taskRows.push({rt, comp, status, isDone, isUrgent:urgentNow, isOD, dlDisplay, dlDate, dlTime});
+  }
+
+  taskRows.sort((a,b)=>{
+    if(a.isUrgent && !b.isUrgent) return -1;
+    if(!a.isUrgent && b.isUrgent) return 1;
+    if(a.isDone && !b.isDone) return 1;
+    if(!a.isDone && b.isDone) return -1;
+    return 0;
+  });
+
+  let html=`<div style="padding:10px 16px;font-size:12px;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:.5px">Period: ${periodLabel} (${fmt(dueDate)})</div>`;
+  html+=`<table><thead><tr><th style="width:4%"></th><th style="width:25%">Task</th><th style="font-size:11px">Assigned To</th>
+    <th style="font-size:11px">Deadline</th><th style="font-size:11px">Reminder</th><th style="font-size:11px">Status</th><th style="font-size:11px">Actions</th></tr></thead><tbody>`;
+
+  for(const row of taskRows){
+    const {rt, comp, status, isDone, isUrgent, dlDisplay}=row;
+
+    let badge='';
+    if(isDone) badge='<span style="background:#dcfce7;color:#16a34a;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600">Done</span>';
+    else if(isUrgent) badge='<span style="background:#fee2e2;color:#dc2626;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600;animation:pulse 1.5s infinite">🔴 Urgent</span>';
+    else badge='<span style="background:#fef9c3;color:#92400e;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600">Pending</span>';
+
+    const canComplete=canCompleteRoutineTask(rt);
+    const canMod=canModifyRoutineTask(rt);
+
+    let actionsHtml='<div style="display:flex;gap:4px;flex-wrap:nowrap">';
+    if(canComplete && !isDone){
+      actionsHtml+=`<button class="btn btn-primary btn-sm" style="font-size:10px;padding:3px 8px" onclick="event.stopPropagation();toggleRoutineTask('${rt.id}','${dueDate}',true)">✅ Complete</button>`;
+    }
+    if(isDone && canMod){
+      actionsHtml+=`<button class="btn btn-warning btn-sm" style="font-size:10px;padding:3px 6px" onclick="event.stopPropagation();archiveRoutineTask('${rt.id}')">📦</button>`;
+    }
+    if(canMod){
+      actionsHtml+=`<button class="btn btn-danger btn-sm" style="font-size:10px;padding:3px 6px" onclick="event.stopPropagation();deleteRoutineTask('${rt.id}')">🗑️</button>`;
+    }
+    actionsHtml+='</div>';
+
+    const attachCount=(rt.attachments||[]).length;
+
+    html+=`<tr style="opacity:${isDone?'0.6':'1'};cursor:pointer;${isDone?'text-decoration:line-through;':''}" onclick="viewRoutineTask('${rt.id}')">
+      <td onclick="event.stopPropagation()">${canComplete?`<input type="checkbox" ${isDone?'checked disabled':''} onchange="toggleRoutineTask('${rt.id}','${dueDate}',this.checked)" style="width:18px;height:18px;cursor:pointer">`:''}</td>
+      <td style="font-weight:600"><div>${escHtml(rt.title)}</div><div style="font-size:11px;color:var(--text3);margin-top:2px">${rt.frequency.charAt(0).toUpperCase()+rt.frequency.slice(1)} · by ${USERS[rt.createdBy]?.name||rt.createdBy}${attachCount?' · 📎'+attachCount:''}</div></td>
+      <td style="font-size:11px">${USERS[rt.assignedTo]?.name||rt.assignedTo}</td>
+      <td style="font-size:11px;${isUrgent?'color:#dc2626;font-weight:700':''}">${dlDisplay}</td>
+      <td style="font-size:11px">⏰ ${rt.reminderTime}</td>
+      <td>${badge}</td>
+      <td onclick="event.stopPropagation()">${actionsHtml}</td>
+    </tr>`;
+  }
+  html+='</tbody></table>';
+
+  const allComps=DB.routineCompletions.filter(c=>c.dueDate===dueDate);
+  const relTasks=taskRows;
+  const doneCount=relTasks.filter(r=>r.isDone).length;
+  const urgentCount=relTasks.filter(r=>r.isUrgent).length;
+  html+=`<div style="padding:14px 16px;border-top:1px solid var(--border-subtle);display:flex;gap:20px;font-size:13px;flex-wrap:wrap">
+    <span style="color:var(--success)">✅ Completed: <strong>${doneCount}</strong></span>
+    <span style="color:var(--danger)">🔴 Urgent: <strong>${urgentCount}</strong></span>
+    <span style="color:var(--text3)">📋 Total: <strong>${relTasks.length}</strong></span>
+  </div>`;
+
+  el.innerHTML=html;
+}
+
+function renderArchivedRoutines(el){
+  const completedComps=DB.routineCompletions.filter(c=>c.status==='completed' && c._archived);
+  const archivedTasks=DB.routineTasks.filter(t=>t.archived);
+
+  const allArchived=[];
+  for(const comp of completedComps){
+    const rt=DB.routineTasks.find(t=>t.id===comp.taskId);
+    if(rt) allArchived.push({type:'completion', rt, comp});
+  }
+  for(const rt of archivedTasks){
+    allArchived.push({type:'task', rt, comp:null});
+  }
+
+  if(!allArchived.length){
+    el.innerHTML=`<div class="empty-state"><div class="empty-icon">📦</div><p>No archived routine tasks</p></div>`;
+    return;
+  }
+
+  let html=`<div style="padding:10px 16px;font-size:12px;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:.5px">Archived Routine Tasks</div>`;
+  html+=`<table><thead><tr><th style="width:30%">Task</th><th style="font-size:11px">Assigned To</th><th style="font-size:11px">Frequency</th><th style="font-size:11px">Completed</th><th style="font-size:11px">Actions</th></tr></thead><tbody>`;
+
+  for(const item of allArchived){
+    const rt=item.rt;
+    const compDate=item.comp?.completedAt?new Date(item.comp.completedAt).toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'}):(rt.archivedDate?new Date(rt.archivedDate).toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'}):'—');
+    const isManager=currentUser==='sumudu';
+    html+=`<tr style="text-decoration:line-through;opacity:0.7">
+      <td style="font-weight:600">${escHtml(rt.title)}</td>
+      <td style="font-size:11px">${USERS[rt.assignedTo]?.name||rt.assignedTo}</td>
+      <td style="font-size:11px">${rt.frequency}</td>
+      <td style="font-size:11px">${compDate}</td>
+      <td><div style="display:flex;gap:4px">
+        ${item.type==='task'?`<button class="btn btn-secondary btn-sm" style="font-size:10px;padding:3px 6px" onclick="restoreRoutineTask('${rt.id}')">♻️ Restore</button>`:''}
+        ${isManager?`<button class="btn btn-danger btn-sm" style="font-size:10px;padding:3px 6px" onclick="${item.type==='task'?`permanentDeleteRoutineTask('${rt.id}')`:`deleteArchivedCompletion('${item.comp?.id}')`}">🗑️</button>`:''}
+      </div></td>
+    </tr>`;
+  }
+  html+='</tbody></table>';
+  el.innerHTML=html;
+}
+
+async function deleteArchivedCompletion(compId){
+  if(!confirm('Remove this archived entry?')) return;
+  DB.routineCompletions=DB.routineCompletions.filter(c=>c.id!==compId);
+  await runDb(sb.from('ff_recurring_completions').delete().eq('id',compId), 'remove archived entry');
+  renderRoutineTasks();
+  showToast('Archived entry removed','info');
+}
+
+async function toggleRoutineTask(taskId, dueDate, checked){
+  const rt=DB.routineTasks.find(t=>t.id===taskId);
+  if(!rt) return;
+  if(!canCompleteRoutineTask(rt)){showToast('You cannot complete this task','error');return;}
+
+  let comp=DB.routineCompletions.find(c=>c.taskId===taskId && c.dueDate===dueDate);
+  if(!comp){
+    comp={id:'rc_'+Date.now()+'_'+Math.random().toString(36).substr(2,5), taskId, dueDate, completedAt:null, completedBy:null, status:'pending', deadlineDate:rt.deadlineDate||'', deadlineTime:rt.deadlineTime||'17:00', autoArchiveAt:null};
+    DB.routineCompletions.push(comp);
+  }
+  if(checked){
+    comp.status='completed';
+    comp.completedAt=new Date().toISOString();
+    comp.completedBy=currentUser;
+
+    let archiveDelay=0;
+    if(rt.frequency==='daily') archiveDelay=3*60*60*1000;
+    else if(rt.frequency==='weekly') archiveDelay=2*24*60*60*1000;
+    else if(rt.frequency==='monthly') archiveDelay=5*24*60*60*1000;
+    else if(rt.frequency==='three_months') archiveDelay=5*24*60*60*1000;
+    const archiveAt=new Date(Date.now()+archiveDelay).toISOString();
+    comp.autoArchiveAt=archiveAt;
+
+    setTimeout(()=>{
+      comp._archived=true;
+      renderRoutineTasks();
+    }, archiveDelay);
+
+    const ok=await runDb(sb.from('ff_recurring_completions').upsert({id:comp.id, task_id:comp.taskId, due_date:comp.dueDate, completed_at:comp.completedAt, completed_by:comp.completedBy, status:comp.status, deadline_date:comp.deadlineDate, deadline_time:comp.deadlineTime, auto_archive_at:archiveAt}), 'mark routine complete');
+    if(!ok){ comp.status='pending'; comp.completedAt=null; comp.completedBy=null; comp.autoArchiveAt=null; renderRoutineTasks(); return; }
+
+    spawnNextRoutineOccurrence(rt);
+  } else {
+    comp.status='pending';
+    comp.completedAt=null;
+    comp.completedBy=null;
+    comp.autoArchiveAt=null;
+    comp._archived=false;
+    await runDb(sb.from('ff_recurring_completions').upsert({id:comp.id, task_id:comp.taskId, due_date:comp.dueDate, completed_at:null, completed_by:null, status:'pending', deadline_date:comp.deadlineDate, deadline_time:comp.deadlineTime, auto_archive_at:null}), 'unmark routine task');
+  }
+  renderRoutineTasks();
+  showToast(checked?'✅ Task marked complete':'Task unmarked','success');
+}
+
+async function spawnNextRoutineOccurrence(rt){
+  let nextDeadline='';
+  let nextDue='';
+  let appearAt=null;
+  const now=new Date();
+
+  if(rt.frequency==='daily'){
+    const tomorrow=new Date(now);
+    tomorrow.setDate(tomorrow.getDate()+1);
+    nextDeadline=tomorrow.toISOString().split('T')[0];
+    nextDue=tomorrow.toISOString().split('T')[0];
+    appearAt=new Date(now);
+    appearAt.setHours(20,0,0,0);
+    if(now>=appearAt) appearAt=now;
+  } else if(rt.frequency==='weekly'){
+    const day=now.getDay();
+    const nextMon=new Date(now);
+    nextMon.setDate(now.getDate()+(day===0?1:(8-day)));
+    nextMon.setHours(7,0,0,0);
+    const nextFri=new Date(nextMon);
+    nextFri.setDate(nextFri.getDate()+4);
+    nextDeadline=nextFri.toISOString().split('T')[0];
+    nextDue=nextMon.toISOString().split('T')[0];
+    appearAt=nextMon;
+  } else if(rt.frequency==='monthly'){
+    const curMonth=now.getMonth();
+    const curYear=now.getFullYear();
+    const appear28=new Date(curYear, curMonth, 28, 7, 0, 0);
+    let targetMonth, targetYear;
+    if(now.getDate()<28){
+      targetMonth=curMonth+1; targetYear=curYear;
+    } else {
+      targetMonth=curMonth+2; targetYear=curYear;
+    }
+    if(targetMonth>11){targetMonth-=12; targetYear++;}
+    const lastDay=new Date(targetYear, targetMonth+1, 0).getDate();
+    nextDeadline=`${targetYear}-${String(targetMonth+1).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
+    nextDue=`${targetYear}-${String(targetMonth+1).padStart(2,'0')}-01`;
+    appearAt=now.getDate()<28?appear28:now;
+  } else if(rt.frequency==='three_months'){
+    const curQ=Math.floor(now.getMonth()/3);
+    let nextQ=curQ+1, y=now.getFullYear();
+    if(nextQ>3){nextQ=0;y++;}
+    const m=nextQ*3;
+    const lastDay=new Date(y,m+3,0).getDate();
+    nextDue=`${y}-${String(m+1).padStart(2,'0')}-01`;
+    nextDeadline=`${y}-${String(m+3).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
+    appearAt=now;
+  }
+
+  const alreadyExists=DB.routineCompletions.find(c=>c.taskId===rt.id && c.dueDate===nextDue && (c.status==='pending'||c.status==='urgent'));
+  if(!alreadyExists && nextDue){
+    const comp={id:'rc_'+Date.now()+'_'+Math.random().toString(36).substr(2,5), taskId:rt.id, dueDate:nextDue, completedAt:null, completedBy:null, status:'pending', deadlineDate:nextDeadline, deadlineTime:rt.deadlineTime||'17:00', autoArchiveAt:null, appearAt:appearAt?appearAt.toISOString():null};
+    DB.routineCompletions.push(comp);
+    await runDb(sb.from('ff_recurring_completions').insert({id:comp.id, task_id:comp.taskId, due_date:comp.dueDate, completed_at:null, completed_by:null, status:'pending', deadline_date:comp.deadlineDate, deadline_time:comp.deadlineTime, auto_archive_at:null}), 'create routine occurrence', {silent:true});
+  }
+}
+
+let pendingRoutineFiles=[];
+
+function showAddRoutineTask(){
+  pendingRoutineFiles=[];
+  const isManager=currentUser==='sumudu';
+  const isDev=currentUser==='de';
+  let assignField='';
+  if(isManager){
+    assignField=`<div><label style="font-size:12px;font-weight:600;color:var(--text2)">Assign To</label>
+      <select id="rt-assign" class="filter-select" style="width:100%">
+        <option value="de">Dev</option><option value="mitiksha">Mitiksha</option>
+      </select></div>`;
+  } else if(isDev){
+    assignField=`<div><label style="font-size:12px;font-weight:600;color:var(--text2)">Assign To</label>
+      <select id="rt-assign" class="filter-select" style="width:100%">
+        <option value="de">Dev</option><option value="mitiksha">Mitiksha</option>
+      </select></div>`;
+  } else {
+    assignField=`<input type="hidden" id="rt-assign" value="mitiksha">`;
+  }
+
+  const todayStr=new Date().toISOString().split('T')[0];
+
+  const body=`<div style="display:flex;flex-direction:column;gap:14px">
+    <div><label style="font-size:12px;font-weight:600;color:var(--text2)">Task Title *</label>
+      <input type="text" id="rt-title" placeholder="e.g. Check petty cash" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:14px;background:var(--surface);color:var(--text)"></div>
+    ${assignField}
+    <div><label style="font-size:12px;font-weight:600;color:var(--text2)">Frequency</label>
+      <select id="rt-frequency" class="filter-select" style="width:100%">
+        <option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option><option value="three_months">Every 3 Months</option>
+      </select></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+      <div><label style="font-size:12px;font-weight:600;color:var(--text2)">Deadline Date *</label>
+        <input type="date" id="rt-deadline-date" value="${todayStr}" min="${todayStr}" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:14px;background:var(--surface);color:var(--text)"></div>
+      <div><label style="font-size:12px;font-weight:600;color:var(--text2)">Deadline Time *</label>
+        <input type="time" id="rt-deadline-time" value="17:00" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:14px;background:var(--surface);color:var(--text)"></div>
+    </div>
+    <div><label style="font-size:12px;font-weight:600;color:var(--text2)">Reminder Time</label>
+      <input type="time" id="rt-reminder" value="09:00" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:14px;background:var(--surface);color:var(--text)"></div>
+    <div><label style="font-size:12px;font-weight:600;color:var(--text2)">Link</label>
+      <input type="url" id="rt-new-link" placeholder="https://..." style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:14px;background:var(--surface);color:var(--text)"></div>
+    <div><label style="font-size:12px;font-weight:600;color:var(--text2)">Remarks</label>
+      <textarea id="rt-new-remarks" rows="2" placeholder="Optional remarks…" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:14px;background:var(--surface);color:var(--text);resize:vertical"></textarea></div>
+    <div>
+      <label style="font-size:12px;font-weight:600;color:var(--text2)">Attachments</label>
+      <div id="rt-new-file-list" style="margin-top:4px;font-size:13px;color:var(--text3)">No files selected</div>
+      <label class="btn btn-secondary btn-sm" style="margin-top:6px;cursor:pointer;display:inline-flex;align-items:center;gap:4px">
+        📎 Choose File<input type="file" multiple onchange="handleNewRoutineFiles(this)" style="display:none">
+      </label>
+    </div>
+  </div>`;
+  openModal('🔄 Add Routine Task', body, [
+    {label:'Add Task', action:'saveRoutineTask()', cls:'btn-primary'},
+    {label:'Cancel', action:'closeModal()', cls:'btn-secondary'}
+  ]);
+}
+
+function handleNewRoutineFiles(input){
+  pendingRoutineFiles=Array.from(input.files);
+  const listEl=document.getElementById('rt-new-file-list');
+  if(listEl){
+    if(pendingRoutineFiles.length){
+      listEl.innerHTML=pendingRoutineFiles.map(f=>`<div style="padding:3px 0">📎 ${escHtml(f.name)} <span style="color:var(--text3)">(${(f.size/1024).toFixed(1)} KB)</span></div>`).join('');
+    } else {
+      listEl.textContent='No files selected';
+    }
+  }
+}
+
+async function saveRoutineTask(){
+  const title=document.getElementById('rt-title')?.value?.trim();
+  const assignTo=document.getElementById('rt-assign')?.value||currentUser;
+  const frequency=document.getElementById('rt-frequency')?.value;
+  const reminder=document.getElementById('rt-reminder')?.value||'09:00';
+  const deadlineDate=document.getElementById('rt-deadline-date')?.value;
+  const deadlineTime=document.getElementById('rt-deadline-time')?.value||'17:00';
+  const link=document.getElementById('rt-new-link')?.value||'';
+  const remarks=document.getElementById('rt-new-remarks')?.value||'';
+  if(!title){ showToast('Please enter a task title','error'); return; }
+  if(!deadlineDate){ showToast('Deadline date is required','error'); return; }
+  if(!deadlineTime){ showToast('Deadline time is required','error'); return; }
+
+  const rtId='rt_'+Date.now();
+  const attachments=[];
+
+  if(pendingRoutineFiles.length){
+    showToast('Uploading files…','info');
+    for(const file of pendingRoutineFiles){
+      if(file.size>10*1024*1024){ showToast(`${file.name} too large (max 10MB)`,'error'); continue; }
+      const filePath=`routine/${rtId}/${Date.now()}_${file.name}`;
+      const {error}=await sb.storage.from('attachments').upload(filePath, file);
+      if(error){ showToast('Upload failed: '+error.message,'error'); continue; }
+      const {data:urlData}=sb.storage.from('attachments').getPublicUrl(filePath);
+      attachments.push({name:file.name, url:urlData.publicUrl, uploadedBy:currentUser, uploadedAt:new Date().toISOString()});
+    }
+  }
+
+  const rt={id:rtId, title, frequency, assignedTo:assignTo, createdBy:currentUser, createdDate:new Date().toISOString(), reminderTime:reminder, active:true, remarks, link, archived:false, archivedDate:null, attachments, deadlineDate, deadlineTime};
+  DB.routineTasks.push(rt);
+  const ok=await runDb(sb.from('ff_recurring_tasks').insert({id:rt.id, title:rt.title, frequency:rt.frequency, assigned_to:rt.assignedTo, created_by:rt.createdBy, created_date:rt.createdDate, reminder_time:rt.reminderTime, active:true, remarks:rt.remarks, link:rt.link, archived:false, archived_date:null, attachments:rt.attachments, deadline_date:rt.deadlineDate, deadline_time:rt.deadlineTime}), 'add routine task');
+  if(!ok){ DB.routineTasks=DB.routineTasks.filter(x=>x.id!==rt.id); return; }
+  pendingRoutineFiles=[];
+  ensureRoutineCompletions();
+  closeModal();
+  currentRoutineTab=frequency;
+  switchRoutineTab(frequency);
+  showToast('✅ Routine task added!','success');
+}
+
+function viewRoutineTask(id){
+  const rt=DB.routineTasks.find(t=>t.id===id);
+  if(!rt) return;
+  const dueDate=getRoutineDueDate(rt.frequency);
+  const comp=DB.routineCompletions.find(c=>c.taskId===rt.id && c.dueDate===dueDate);
+  const status=comp?comp.status:'pending';
+  const freqLabel=rt.frequency==='three_months'?'Every 3 Months':rt.frequency.charAt(0).toUpperCase()+rt.frequency.slice(1);
+
+  const dlDate=comp?.deadlineDate||rt.deadlineDate||'';
+  const dlTime=comp?.deadlineTime||rt.deadlineTime||'17:00';
+  const dlDisplay=dlDate?`${new Date(dlDate+'T'+dlTime).toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'})} at ${dlTime}`:'Not set';
+
+  let urgentNow=false;
+  if(status!=='completed' && dlDate){
+    const dl=new Date(dlDate+'T'+dlTime);
+    if(new Date()>=dl) urgentNow=true;
+  }
+
+  const statusBadge=status==='completed'?'<span style="background:#dcfce7;color:#16a34a;padding:3px 10px;border-radius:99px;font-size:12px;font-weight:600">Completed</span>'
+    :urgentNow?'<span style="background:#fee2e2;color:#dc2626;padding:3px 10px;border-radius:99px;font-size:12px;font-weight:600">🔴 Urgent</span>'
+    :'<span style="background:#fef9c3;color:#92400e;padding:3px 10px;border-radius:99px;font-size:12px;font-weight:600">Pending</span>';
+
+  const attachList=(rt.attachments||[]).map(a=>`<div style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:var(--bg-subtle);border-radius:var(--radius-sm);margin-top:4px">
+    <span style="font-size:13px">📎</span>
+    <a href="${sanitizeUrl(a.url)}" target="_blank" style="font-size:13px;color:var(--primary);flex:1;word-break:break-all">${escHtml(a.name)}</a>
+  </div>`).join('');
+
+  const isManager=currentUser==='sumudu';
+  const canMod=canModifyRoutineTask(rt);
+
+  const freqField=canMod?`<select id="rt-edit-freq" class="filter-select" style="width:100%;margin-top:2px">
+        <option value="daily" ${rt.frequency==='daily'?'selected':''}>Daily</option>
+        <option value="weekly" ${rt.frequency==='weekly'?'selected':''}>Weekly</option>
+        <option value="monthly" ${rt.frequency==='monthly'?'selected':''}>Monthly</option>
+        <option value="three_months" ${rt.frequency==='three_months'?'selected':''}>Every 3 Months</option>
+      </select>`:`<div style="font-weight:600;margin-top:2px">${freqLabel}</div>`;
+
+  const reminderField=canMod?`<input type="time" id="rt-edit-reminder" value="${rt.reminderTime}" style="width:100%;padding:4px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;background:var(--surface);color:var(--text);margin-top:2px">`
+    :`<div style="font-weight:600;margin-top:2px">⏰ ${rt.reminderTime}</div>`;
+
+  const statusField=canMod?`<select id="rt-edit-status" class="filter-select" style="width:100%;margin-top:2px">
+        <option value="pending" ${status==='pending'||status==='urgent'?'selected':''}>Pending</option>
+        <option value="completed" ${status==='completed'?'selected':''}>Completed</option>
+      </select>`:`<div style="margin-top:4px">${statusBadge}</div>`;
+
+  const body=`<div style="display:flex;flex-direction:column;gap:16px">
+    ${canMod?`<div>
+      <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Title ✏️</div>
+      <input type="text" id="rt-edit-title" value="${escHtml(rt.title)}" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:15px;font-weight:600;background:var(--surface);color:var(--text)">
+    </div>`:''}
+    <div style="background:var(--bg-subtle);padding:12px 16px;border-radius:var(--radius-sm);border-left:4px solid ${urgentNow?'#dc2626':'var(--primary)'}">
+      <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px">Deadline ✏️</div>
+      <div style="display:flex;gap:10px;align-items:center;margin-top:6px;flex-wrap:wrap">
+        <input type="date" id="rt-edit-dl-date" value="${dlDate}" style="padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:14px;font-weight:600;background:var(--surface);color:${urgentNow?'#dc2626':'var(--text)'}">
+        <input type="time" id="rt-edit-dl-time" value="${dlTime}" style="padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:14px;font-weight:600;background:var(--surface);color:${urgentNow?'#dc2626':'var(--text)'}">
+        ${urgentNow?'<span style="font-size:12px;background:#fee2e2;color:#dc2626;padding:2px 8px;border-radius:99px">URGENT</span>':''}
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+      <div>
+        <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px">Assigned To</div>
+        <div style="font-weight:600;margin-top:2px">${USERS[rt.assignedTo]?.name||rt.assignedTo}</div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px">Frequency${canMod?' ✏️':''}</div>
+        ${freqField}
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px">Reminder${canMod?' ✏️':''}</div>
+        ${reminderField}
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px">Status${canMod?' ✏️':''}</div>
+        ${statusField}
+      </div>
+    </div>
+    <div style="border-top:1px solid var(--border-subtle);padding-top:14px">
+      <label style="font-size:12px;font-weight:600;color:var(--text2)">Remarks</label>
+      <textarea id="rt-remarks" rows="3" ${canMod?'':'disabled'} style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:14px;background:var(--surface);color:var(--text);resize:vertical;margin-top:4px">${escHtml(rt.remarks||'')}</textarea>
+    </div>
+    <div>
+      <label style="font-size:12px;font-weight:600;color:var(--text2)">Link</label>
+      <input type="url" id="rt-link" value="${escHtml(rt.link||'')}" ${canMod?'':'disabled'} placeholder="https://..." style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:14px;background:var(--surface);color:var(--text);margin-top:4px">
+      ${rt.link?`<a href="${sanitizeUrl(rt.link)}" target="_blank" style="color:var(--primary);font-size:12px;margin-top:4px;display:inline-block">🔗 Open link in new tab</a>`:''}
+    </div>
+    <div>
+      <label style="font-size:12px;font-weight:600;color:var(--text2)">Attachments</label>
+      <div id="rt-attach-list" style="margin-top:4px">${attachList||'<div style="color:var(--text3);font-size:13px">No attachments yet</div>'}</div>
+      ${canMod?`<label class="btn btn-secondary btn-sm" style="margin-top:8px;cursor:pointer;display:inline-flex;align-items:center;gap:4px">
+        📎 Attach File<input type="file" id="rt-attach-input" onchange="uploadRoutineAttachment('${rt.id}')" style="display:none">
+      </label>`:''}
+    </div>
+    <div style="font-size:11px;color:var(--text3);border-top:1px solid var(--border-subtle);padding-top:8px">
+      Created by ${USERS[rt.createdBy]?.name||rt.createdBy} · ${rt.createdDate?new Date(rt.createdDate).toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'}):'—'}
+    </div>
+  </div>`;
+
+  const buttons=[{label:'Save', action:`saveRoutineDetails('${id}')`, cls:'btn-primary'},{label:'Close', action:'closeModal()', cls:'btn-secondary'}];
+  openModal('🔄 '+escHtml(rt.title), body, buttons);
+}
+
+async function saveRoutineDetails(id){
+  const rt=DB.routineTasks.find(t=>t.id===id);
+  if(!rt) return;
+  const canMod=canModifyRoutineTask(rt);
+  if(canMod){
+    rt.remarks=document.getElementById('rt-remarks')?.value||'';
+    rt.link=document.getElementById('rt-link')?.value||'';
+    const newTitle=document.getElementById('rt-edit-title')?.value?.trim();
+    if(newTitle && newTitle!==rt.title) rt.title=newTitle;
+  }
+  const dbUpdate={remarks:rt.remarks, link:rt.link, title:rt.title};
+
+  if(canMod){
+    const newFreq=document.getElementById('rt-edit-freq')?.value;
+    const newReminder=document.getElementById('rt-edit-reminder')?.value;
+    const newStatus=document.getElementById('rt-edit-status')?.value;
+
+    if(newFreq && newFreq!==rt.frequency){
+      rt.frequency=newFreq;
+      dbUpdate.frequency=newFreq;
+    }
+    if(newReminder && newReminder!==rt.reminderTime){
+      rt.reminderTime=newReminder;
+      dbUpdate.reminder_time=newReminder;
+    }
+    if(newStatus){
+      const dueDate=getRoutineDueDate(rt.frequency);
+      let comp=DB.routineCompletions.find(c=>c.taskId===id && c.dueDate===dueDate);
+      if(!comp){
+        comp={id:'rc_'+Date.now()+'_'+Math.random().toString(36).substr(2,5), taskId:id, dueDate, completedAt:null, completedBy:null, status:'pending', deadlineDate:rt.deadlineDate||'', deadlineTime:rt.deadlineTime||'17:00', autoArchiveAt:null};
+        DB.routineCompletions.push(comp);
+      }
+      if(newStatus!==comp.status){
+        comp.status=newStatus;
+        comp.completedAt=newStatus==='completed'?new Date().toISOString():null;
+        comp.completedBy=newStatus==='completed'?currentUser:null;
+        if(newStatus==='completed') spawnNextRoutineOccurrence(rt);
+        await runDb(sb.from('ff_recurring_completions').upsert({id:comp.id, task_id:comp.taskId, due_date:comp.dueDate, completed_at:comp.completedAt, completed_by:comp.completedBy, status:comp.status, deadline_date:comp.deadlineDate, deadline_time:comp.deadlineTime}), 'sync routine completion', {silent:true});
+      }
+    }
+  }
+
+  const newDlDate=document.getElementById('rt-edit-dl-date')?.value||'';
+  const newDlTime=document.getElementById('rt-edit-dl-time')?.value||'17:00';
+  if(newDlDate!==rt.deadlineDate||newDlTime!==rt.deadlineTime){
+    rt.deadlineDate=newDlDate;
+    rt.deadlineTime=newDlTime;
+    dbUpdate.deadline_date=newDlDate;
+    dbUpdate.deadline_time=newDlTime;
+    const dueDate=getRoutineDueDate(rt.frequency);
+    const comp=DB.routineCompletions.find(c=>c.taskId===id && c.dueDate===dueDate);
+    if(comp){
+      comp.deadlineDate=newDlDate;
+      comp.deadlineTime=newDlTime;
+      await runDb(sb.from('ff_recurring_completions').update({deadline_date:newDlDate, deadline_time:newDlTime}).eq('id',comp.id), 'update routine deadline', {silent:true});
+    }
+  }
+
+  await runDb(sb.from('ff_recurring_tasks').update(dbUpdate).eq('id',id), 'update routine task');
+  closeModal();
+  renderRoutineTasks();
+  showToast('✅ Saved!','success');
+}
+
+async function uploadRoutineAttachment(taskId){
+  const input=document.getElementById('rt-attach-input');
+  if(!input||!input.files.length) return;
+  const file=input.files[0];
+  if(file.size>10*1024*1024){ showToast('File too large (max 10MB)','error'); return; }
+  const rt=DB.routineTasks.find(t=>t.id===taskId);
+  if(!rt) return;
+  showToast('Uploading…','info');
+  const filePath=`routine/${taskId}/${Date.now()}_${file.name}`;
+  const {data,error}=await sb.storage.from('attachments').upload(filePath, file);
+  if(error){ showToast('Upload failed: '+error.message,'error'); return; }
+  const {data:urlData}=sb.storage.from('attachments').getPublicUrl(filePath);
+  const att={name:file.name, url:urlData.publicUrl, uploadedBy:currentUser, uploadedAt:new Date().toISOString()};
+  if(!rt.attachments) rt.attachments=[];
+  rt.attachments.push(att);
+  await runDb(sb.from('ff_recurring_tasks').update({attachments:rt.attachments}).eq('id',taskId), 'save attachment');
+  input.value='';
+  showToast('📎 File attached!','success');
+  viewRoutineTask(taskId);
+}
+
+async function archiveRoutineTask(id){
+  if(!confirm('Archive this routine task?')) return;
+  const rt=DB.routineTasks.find(t=>t.id===id);
+  if(!rt) return;
+  rt.archived=true;
+  rt.archivedDate=new Date().toISOString();
+  await runDb(sb.from('ff_recurring_tasks').update({archived:true, archived_date:rt.archivedDate}).eq('id',id), 'archive routine task');
+  renderRoutineTasks();
+  showToast('📦 Task archived','success');
+}
+
+async function restoreRoutineTask(id){
+  const rt=DB.routineTasks.find(t=>t.id===id);
+  if(!rt) return;
+  rt.archived=false;
+  rt.archivedDate=null;
+  await runDb(sb.from('ff_recurring_tasks').update({archived:false, archived_date:null}).eq('id',id), 'restore routine task');
+  ensureRoutineCompletions();
+  renderRoutineTasks();
+  showToast('♻️ Task restored','success');
+}
+
+async function deleteRoutineTask(id){
+  if(currentUser!=='sumudu'){showToast('Only Sumudu can delete routine tasks','error');return;}
+  if(!confirm('Delete this routine task permanently?')) return;
+  DB.routineTasks=DB.routineTasks.filter(t=>t.id!==id);
+  DB.routineCompletions=DB.routineCompletions.filter(c=>c.taskId!==id);
+  await runDb(sb.from('ff_recurring_tasks').delete().eq('id',id), 'delete routine task');
+  await runDb(sb.from('ff_recurring_completions').delete().eq('task_id',id), 'delete routine history', {silent:true});
+  renderRoutineTasks();
+  showToast('Routine task deleted','info');
+}
+
+async function permanentDeleteRoutineTask(id){
+  if(currentUser!=='sumudu'){showToast('Only Sumudu can delete routine tasks','error');return;}
+  if(!confirm('Permanently delete this archived task? This cannot be undone.')) return;
+  DB.routineTasks=DB.routineTasks.filter(t=>t.id!==id);
+  DB.routineCompletions=DB.routineCompletions.filter(c=>c.taskId!==id);
+  await runDb(sb.from('ff_recurring_tasks').delete().eq('id',id), 'delete routine task');
+  await runDb(sb.from('ff_recurring_completions').delete().eq('task_id',id), 'delete routine history', {silent:true});
+  renderRoutineTasks();
+  showToast('Task permanently deleted','info');
+}
+
+function exportRoutineTasks(){
+  const tasks=DB.routineTasks.filter(t=>t.active && !t.archived);
+  if(!tasks.length){ showToast('No routine tasks to export','warning'); return; }
+  const rows=tasks.map(rt=>{
+    const dueDate=getRoutineDueDate(rt.frequency);
+    const comp=DB.routineCompletions.find(c=>c.taskId===rt.id && c.dueDate===dueDate);
+    return {
+      Title:rt.title, Frequency:rt.frequency, 'Assigned To':USERS[rt.assignedTo]?.name||rt.assignedTo,
+      'Deadline Date':rt.deadlineDate||'', 'Deadline Time':rt.deadlineTime||'',
+      'Reminder Time':rt.reminderTime, Status:comp?comp.status:'pending',
+      Remarks:rt.remarks||'', Link:rt.link||'', 'Created By':USERS[rt.createdBy]?.name||rt.createdBy
+    };
+  });
+  const ws=XLSX.utils.json_to_sheet(rows);
+  const wb=XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb,ws,'Routine Tasks');
+  XLSX.writeFile(wb,'RoutineTasks_'+today()+'.xlsx');
+  showToast('📥 Exported!','success');
+}
+
+
+async function importRoutineTasks(input){
+  const file=input.files[0];
+  if(!file) return;
+  const data=await file.arrayBuffer();
+  const wb=XLSX.read(data);
+  const ws=wb.Sheets[wb.SheetNames[0]];
+  const rows=XLSX.utils.sheet_to_json(ws);
+  let count=0;
+  for(const row of rows){
+    const title=(row.Title||row.title||'').trim();
+    if(!title) continue;
+    const freq=(row.Frequency||row.frequency||'daily').toLowerCase();
+    if(!['daily','weekly','monthly'].includes(freq)) continue;
+    let assignTo=(row['Assigned To']||row.assigned_to||'').toLowerCase();
+    if(assignTo.includes('dev')) assignTo='de';
+    else if(assignTo.includes('miti')) assignTo='mitiksha';
+    else assignTo='de';
+    const reminder=row['Reminder Time']||row.reminder_time||'09:00';
+    const rt={id:'rt_'+Date.now()+'_'+count, title, frequency:freq, assignedTo:assignTo, createdBy:'sumudu', createdDate:new Date().toISOString(), reminderTime:reminder, active:true, remarks:row.Remarks||'', link:row.Link||'', archived:false, archivedDate:null};
+    DB.routineTasks.push(rt);
+    await runDb(sb.from('ff_recurring_tasks').insert({id:rt.id, title:rt.title, frequency:rt.frequency, assigned_to:rt.assignedTo, created_by:rt.createdBy, created_date:rt.createdDate, reminder_time:rt.reminderTime, active:true, remarks:rt.remarks, link:rt.link, archived:false, archived_date:null}), 're-create routine task', {silent:true});
+    count++;
+  }
+  input.value='';
+  if(count){
+    ensureRoutineCompletions();
+    renderRoutineTasks();
+    showToast(`📤 Imported ${count} routine task(s)!`,'success');
+  } else {
+    showToast('No valid tasks found in file','warning');
+  }
+}
+
+// Routine task reminders — check every minute + auto 5PM EOD
+let routineReminderInterval=null;
+function startRoutineReminders(){
+  if(routineReminderInterval) clearInterval(routineReminderInterval);
+  routineReminderInterval=setInterval(()=>{checkRoutineReminders();checkAutoRoutineEOD();checkAutoArchiveRoutines();checkRoutineReappear();renderRoutineTasks();}, 60000);
+  checkRoutineReminders();
+}
+
+function checkRoutineReminders(){
+  if(!currentUser || currentUser==='sumudu') return;
+  const now=new Date();
+  const hhmm=String(now.getHours()).padStart(2,'0')+':'+String(now.getMinutes()).padStart(2,'0');
+  const todayStr=today();
+  const shownKey='ffRoutineReminder_'+currentUser+'_'+todayStr;
+  const shown=JSON.parse(localStorage.getItem(shownKey)||'[]');
+
+  const myTasks=DB.routineTasks.filter(t=>t.active && !t.archived && t.assignedTo===currentUser);
+  for(const rt of myTasks){
+    if(shown.includes(rt.id)) continue;
+    if(rt.reminderTime!==hhmm) continue;
+    const dueDate=getRoutineDueDate(rt.frequency);
+    const comp=DB.routineCompletions.find(c=>c.taskId===rt.id && c.dueDate===dueDate);
+    if(comp && comp.status==='completed') continue;
+    shown.push(rt.id);
+    localStorage.setItem(shownKey, JSON.stringify(shown));
+    showRoutineReminder(rt);
+  }
+}
+
+function checkAutoRoutineEOD(){
+  const now=new Date();
+  const hh=now.getHours(), mm=now.getMinutes();
+  if(hh!==17 || mm!==0) return;
+  const sentKey='ffRoutineEODSent_'+today();
+  if(localStorage.getItem(sentKey)) return;
+  localStorage.setItem(sentKey,'1');
+  sendRoutineEODEmail();
+}
+
+function showRoutineReminder(rt){
+  const freqLabel=rt.frequency==='three_months'?'Every 3 Months':rt.frequency.charAt(0).toUpperCase()+rt.frequency.slice(1);
+  openModal('⏰ Routine Task Reminder', `
+    <div style="text-align:center;padding:20px">
+      <div style="font-size:48px;margin-bottom:12px">🔔</div>
+      <h3 style="margin:0 0 8px;font-size:18px">${escHtml(rt.title)}</h3>
+      <p style="color:var(--text3);font-size:14px">${freqLabel} task — due now</p>
+    </div>`, [
+    {label:'Go to Routine Tasks', action:"closeModal();navigateTo('routine-tasks')", cls:'btn-primary'},
+    {label:'Dismiss', action:'closeModal()', cls:'btn-secondary'}
+  ]);
+}
+
+async function sendRoutineEODEmail(){
+  for(const uid of ['de','mitiksha']){
+    const u=USERS[uid];
+    const myTasks=DB.routineTasks.filter(t=>t.active && !t.archived && t.assignedTo===uid);
+    if(!myTasks.length) continue;
+    const todayDue=getRoutineDueDate('daily');
+    const weekDue=getRoutineDueDate('weekly');
+    const monthDue=getRoutineDueDate('monthly');
+    const qDue=getRoutineDueDate('three_months');
+
+    let rows='';
+    let doneCount=0, odCount=0;
+    for(const rt of myTasks){
+      const due=rt.frequency==='daily'?todayDue:rt.frequency==='weekly'?weekDue:rt.frequency==='three_months'?qDue:monthDue;
+      const comp=DB.routineCompletions.find(c=>c.taskId===rt.id && c.dueDate===due);
+      const st=comp?comp.status:'pending';
+      if(st==='completed') doneCount++;
+      if(st==='overdue') odCount++;
+      const stColor=st==='completed'?'#22c55e':st==='overdue'?'#ef4444':'#f59e0b';
+      rows+=`<tr><td>${escHtml(rt.title)}</td><td>${rt.frequency}</td><td style="color:${stColor};font-weight:600">${st.charAt(0).toUpperCase()+st.slice(1)}</td><td>${escHtml(rt.remarks||'—')}</td></tr>`;
+    }
+
+    const subject=`🔄 Routine Tasks EOD — ${u.name}`;
+    const body=`<p>Hi <strong>${u.name}</strong>,</p>
+      <p>Here's your routine tasks summary for today:</p>
+      <table><tr><th>Task</th><th>Frequency</th><th>Status</th><th>Remarks</th></tr>${rows}</table>
+      <p style="margin-top:12px">✅ Completed: <strong>${doneCount}</strong> | ⚠️ Overdue: <strong>${odCount}</strong> | 📋 Total: <strong>${myTasks.length}</strong></p>
+      ${odCount?'<p style="color:#ef4444"><strong>Please complete your overdue routine tasks!</strong></p>':''}
+      <p style="margin-top:14px;color:#6366f1;font-weight:600">— FinanceFlow Task Management</p>`;
+    const email={id:'em_'+Date.now()+Math.random(),type:'routine_eod',subject,to:u.email,from:'system@financeflow.com',body,timestamp:new Date().toISOString()};
+    DB.emailLog.push(email);
+    await dbInsertEmail(email);
+    await sendRealEmail(u.email, subject, body);
+  }
+  showToast('🔄 Routine EOD emails sent!','success');
+  if(document.getElementById('page-emails')?.classList.contains('active')) renderEmailLog();
+}
+
+// ═══════════════════════════════════════════════════════
+// KEYBOARD NAV — Escape to close modal/sidebar
+// ═══════════════════════════════════════════════════════
+document.addEventListener('keydown', e=>{
+  if(e.key==='Escape'){
+    if(!document.getElementById('modal-overlay').classList.contains('hidden')) closeModal();
+    closeSidebar();
+  }
+});
+
+// ═══════════════════════════════════════════════════════
+// SEED DATA
+// ═══════════════════════════════════════════════════════
+function seedData(){}
+
+// ═══════════════════════════════════════════════════════
+// MIGRATE LOCALSTORAGE → SUPABASE
+// ═══════════════════════════════════════════════════════
+async function migrateLocalToSupabase(){
+  try {
+    const d=localStorage.getItem('ffdb');
+    if(!d){ showToast('No local data to migrate','warning'); return; }
+    const local=JSON.parse(d);
+    if(!local.tasks||!local.tasks.length){ showToast('No tasks to migrate','warning'); return; }
+    let count=0;
+    for(const t of local.tasks){
+      const row=taskToRow(t);
+      const {error}=await sb.from('ff_tasks').upsert(row);
+      if(!error) count++;
+    }
+    for(const c of (local.comments||[])){
+      await sb.from('ff_comments').upsert({id:c.id,task_id:c.taskId,user_id:c.userId,text:c.text,created_date:c.createdDate,attachments:c.attachments||[]});
+    }
+    for(const e of (local.emailLog||[])){
+      await sb.from('ff_email_log').upsert({id:e.id,type:e.type,subject:e.subject,to_email:e.to,from_email:e.from,body:e.body,task_id:e.taskId||null,timestamp:e.timestamp});
+    }
+    const sp=local.stepProgress||{};
+    for(const tid of Object.keys(sp)){
+      for(const sid of Object.keys(sp[tid])){
+        await sb.from('ff_step_progress').upsert({task_id:tid,step_id:sid,done:sp[tid][sid]});
+      }
+    }
+    for(const t of (local.recycleBin||[])){
+      await dbInsertRecycleBin(t).catch(()=>{});
+    }
+    localStorage.removeItem('ffdb');
+    localStorage.removeItem('ffdb_v');
+    await loadDB();
+    showToast(`✅ Migrated ${count} tasks to cloud!`,'success');
+    renderDashboard();
+  } catch(e){ showToast('Migration error: '+e.message,'error'); console.error(e); }
+}
+
+// ═══════════════════════════════════════════════════════
+// PERSONAL TASKS (Dev/Mitiksha)
+// ═══════════════════════════════════════════════════════
+let ptFilter='all';
+function switchPTFilter(f){
+  ptFilter=f;
+  document.querySelectorAll('[id^="pt-tab-"]').forEach(b=>{
+    b.className=b.id==='pt-tab-'+f?'btn btn-sm btn-primary':'btn btn-sm btn-secondary';
+  });
+  renderPersonalTasks();
+}
+function markOverduePersonalTasks(){
+  const now=new Date();
+  DB.personalTasks.forEach(t=>{
+    if(t.status==='Pending'){
+      const dl=new Date(t.deadlineDate+'T'+t.deadlineTime);
+      if(dl<now) t.status='Overdue';
+    }
+  });
+}
+function renderPersonalTasks(){
+  const el=document.getElementById('pt-officer-content');
+  if(!el) return;
+  let tasks=DB.personalTasks.filter(t=>t.owner===currentUser);
+  if(ptFilter!=='all') tasks=tasks.filter(t=>t.status===ptFilter);
+  tasks.sort((a,b)=>new Date(a.deadlineDate+'T'+a.deadlineTime)-new Date(b.deadlineDate+'T'+b.deadlineTime));
+  if(!tasks.length){el.innerHTML='<p style="text-align:center;color:var(--text3);padding:32px">No tasks found</p>';return;}
+  el.innerHTML=tasks.map(t=>{
+    const dl=new Date(t.deadlineDate+'T'+t.deadlineTime);
+    const statusColor=t.status==='Completed'?'#10b981':t.status==='Overdue'?'#ef4444':'#f59e0b';
+    const recLabel=t.recurrence!=='none'?` <span style="background:var(--bg2);padding:2px 8px;border-radius:12px;font-size:11px">${t.recurrence}</span>`:'';
+    return `<div style="display:flex;justify-content:space-between;align-items:center;padding:14px 16px;border-bottom:1px solid var(--border);gap:12px">
+      <div style="flex:1;min-width:0">
+        <div style="font-weight:600;font-size:14px;${t.status==='Completed'?'text-decoration:line-through;opacity:.6':''}">${escHtml(t.title)}${recLabel}</div>
+        ${t.description?`<div style="font-size:12px;color:var(--text3);margin-top:2px">${escHtml(t.description)}</div>`:''}
+        <div style="font-size:11px;color:var(--text3);margin-top:4px">Due: ${dl.toLocaleDateString('en-GB')} ${dl.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'})}${t.link?` | <a href="${sanitizeUrl(t.link)}" target="_blank" style="color:var(--primary)">Link</a>`:''}</div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-shrink:0">
+        <span style="background:${statusColor};color:#fff;padding:2px 10px;border-radius:12px;font-size:11px;font-weight:600">${t.status}</span>
+        ${t.status!=='Completed'?`<button class="btn btn-primary btn-sm" onclick="markCompletePersonalTask('${t.id}')">Complete</button>`:''}
+      </div>
+    </div>`;
+  }).join('');
+}
+function showAddPersonalTask(){
+  const today=new Date().toISOString().split('T')[0];
+  showModal('Add Personal Task',`
+    <div class="form-group"><label class="form-label">Title *</label><input class="form-input" id="pt-title" placeholder="Task title"></div>
+    <div class="form-group"><label class="form-label">Description</label><textarea class="form-input" id="pt-desc" rows="2" placeholder="Optional description"></textarea></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+      <div class="form-group"><label class="form-label">Deadline Date *</label><input type="date" class="form-input" id="pt-date" min="${today}" required></div>
+      <div class="form-group"><label class="form-label">Deadline Time *</label><input type="time" class="form-input" id="pt-time" value="17:00" required></div>
+    </div>
+    <div class="form-group"><label class="form-label">Recurrence</label>
+      <select class="form-input" id="pt-recurrence">
+        <option value="none">None (One-time)</option>
+        <option value="daily">Daily</option>
+        <option value="weekly">Weekly</option>
+        <option value="monthly">Monthly</option>
+        <option value="quarterly">Every 3 Months</option>
+      </select>
+    </div>
+    <div class="form-group"><label class="form-label">Link (optional)</label><input type="url" class="form-input" id="pt-link" placeholder="https://..."></div>
+    <div style="text-align:right;margin-top:16px">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="savePersonalTask()" style="margin-left:8px">Save Task</button>
+    </div>
+  `);
+}
+async function savePersonalTask(){
+  const title=document.getElementById('pt-title').value.trim();
+  const desc=document.getElementById('pt-desc').value.trim();
+  const date=document.getElementById('pt-date').value;
+  const time=document.getElementById('pt-time').value;
+  const recurrence=document.getElementById('pt-recurrence').value;
+  const link=document.getElementById('pt-link').value.trim();
+  if(!title){showToast('Title is required','error');return;}
+  if(!date){showToast('Deadline date is required','error');return;}
+  if(!time){showToast('Deadline time is required','error');return;}
+  const task={title,description:desc,owner:currentUser,deadline_date:date,deadline_time:time,recurrence,status:'Pending',link,created_date:new Date().toISOString().split('T')[0],attachments:[]};
+  const{data,error}=await sb.from('ff_personal_tasks').insert([task]).select();
+  if(error){showToast('Error saving task','error');console.error(error);return;}
+  const r=data[0];
+  DB.personalTasks.push({id:r.id,title:r.title,description:r.description||'',owner:r.owner,deadlineDate:r.deadline_date,deadlineTime:r.deadline_time||'17:00',recurrence:r.recurrence||'none',status:r.status||'Pending',completionDate:r.completion_date,createdDate:r.created_date,link:r.link||'',attachments:r.attachments||[]});
+  closeModal();
+  showToast('Task added!','success');
+  renderPersonalTasks();
+}
+async function markCompletePersonalTask(id){
+  const t=DB.personalTasks.find(x=>x.id===id);
+  if(!t) return;
+  t.status='Completed';
+  t.completionDate=new Date().toISOString().split('T')[0];
+  const ok=await runDb(sb.from('ff_personal_tasks').update({status:'Completed',completion_date:t.completionDate}).eq('id',id), 'complete task');
+  if(!ok){ t.status='Pending'; t.completionDate=null; renderPersonalTasks(); return; }
+  showToast('Task completed!','success');
+  if(t.recurrence!=='none') spawnNextPersonalTask(t);
+  renderPersonalTasks();
+}
+async function spawnNextPersonalTask(t){
+  const d=new Date(t.deadlineDate);
+  if(t.recurrence==='daily') d.setDate(d.getDate()+1);
+  else if(t.recurrence==='weekly') d.setDate(d.getDate()+7);
+  else if(t.recurrence==='monthly') d.setMonth(d.getMonth()+1);
+  else if(t.recurrence==='quarterly') d.setMonth(d.getMonth()+3);
+  const next={title:t.title,description:t.description||'',owner:t.owner,deadline_date:d.toISOString().split('T')[0],deadline_time:t.deadlineTime,recurrence:t.recurrence,status:'Pending',link:t.link||'',created_date:new Date().toISOString().split('T')[0],attachments:[]};
+  const{data,error}=await sb.from('ff_personal_tasks').insert([next]).select();
+  if(!error&&data&&data[0]){
+    const r=data[0];
+    DB.personalTasks.push({id:r.id,title:r.title,description:r.description||'',owner:r.owner,deadlineDate:r.deadline_date,deadlineTime:r.deadline_time||'17:00',recurrence:r.recurrence||'none',status:'Pending',completionDate:null,createdDate:r.created_date,link:r.link||'',attachments:r.attachments||[]});
+  }
+}
+function toggleSumuduPTView(showTeam){
+  document.getElementById('personal-tasks-sumudu-view').style.display=showTeam?'':'none';
+  document.getElementById('personal-tasks-sumudu-own').style.display=showTeam?'none':'';
+  if(showTeam) renderPersonalTasksView();
+}
+function renderPersonalTasksView(){
+  const user=document.getElementById('pt-view-user').value;
+  const el=document.getElementById('pt-view-content');
+  if(!el) return;
+  markOverduePersonalTasks();
+  let tasks=DB.personalTasks.filter(t=>t.owner===user);
+  tasks.sort((a,b)=>new Date(a.deadlineDate+'T'+a.deadlineTime)-new Date(b.deadlineDate+'T'+b.deadlineTime));
+  if(!tasks.length){el.innerHTML='<p style="text-align:center;color:var(--text3);padding:32px">No personal tasks</p>';return;}
+  const pending=tasks.filter(t=>t.status==='Pending').length;
+  const completed=tasks.filter(t=>t.status==='Completed').length;
+  const overdue=tasks.filter(t=>t.status==='Overdue').length;
+  let html=`<div style="display:flex;gap:16px;margin-bottom:16px;flex-wrap:wrap">
+    <div style="background:#f59e0b22;color:#f59e0b;padding:8px 16px;border-radius:8px;font-weight:600">Pending: ${pending}</div>
+    <div style="background:#10b98122;color:#10b981;padding:8px 16px;border-radius:8px;font-weight:600">Completed: ${completed}</div>
+    <div style="background:#ef444422;color:#ef4444;padding:8px 16px;border-radius:8px;font-weight:600">Overdue: ${overdue}</div>
+  </div>`;
+  html+=tasks.map(t=>{
+    const dl=new Date(t.deadlineDate+'T'+t.deadlineTime);
+    const statusColor=t.status==='Completed'?'#10b981':t.status==='Overdue'?'#ef4444':'#f59e0b';
+    const recLabel=t.recurrence!=='none'?` <span style="background:var(--bg2);padding:2px 8px;border-radius:12px;font-size:11px">${t.recurrence}</span>`:'';
+    return `<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid var(--border)">
+      <div style="flex:1"><div style="font-weight:600;font-size:14px;${t.status==='Completed'?'text-decoration:line-through;opacity:.6':''}">${escHtml(t.title)}${recLabel}</div>
+      <div style="font-size:11px;color:var(--text3);margin-top:4px">Due: ${dl.toLocaleDateString('en-GB')} ${dl.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'})}</div></div>
+      <span style="background:${statusColor};color:#fff;padding:2px 10px;border-radius:12px;font-size:11px;font-weight:600">${t.status}</span>
+    </div>`;
+  }).join('');
+  el.innerHTML=html;
+}
+
+// ═══════════════════════════════════════════════════════
+// INIT — called once by main.js after the DOM is ready.
+// ═══════════════════════════════════════════════════════
+export async function bootstrapApp(){
+  seedData();
+
+  const savedTheme=localStorage.getItem('ffTheme')||'light';
+  document.documentElement.setAttribute('data-theme',savedTheme);
+
+  document.getElementById('motivation-auth').textContent=`”${getMotivation()}”`;
+
+  // Pre-select the last-used account in the dropdown (UI convenience only).
+  const savedUser=localStorage.getItem('ffUser');
+  if(savedUser && USERS[savedUser]){
+    document.getElementById('login-user').value=savedUser;
+  }
+
+  // Restore a session only if Supabase confirms a valid, non-expired one exists.
+  try{
+    const { data:{ session } } = await sb.auth.getSession();
+    if(session && session.user){
+      const uname = EMAIL_TO_USERNAME[(session.user.email||'').toLowerCase()];
+      if(uname && USERS[uname]){
+        currentUser = uname;
+        document.getElementById('login-user').value = uname;
+        initApp();
+      }
+    }
+  }catch(e){ console.error('session restore failed', e); }
+}
+
+// ═══════════════════════════════════════════════════════
+// EXPORTS — functions referenced by inline onclick="" handlers in
+// index.html. main.js re-exposes these on window so the existing
+// markup keeps working without rewriting every handler to
+// addEventListener (a separate, larger follow-up change).
+// ═══════════════════════════════════════════════════════
+export {
+  addAttachmentToTask,
+  addComment,
+  addStep,
+  archiveRoutineTask,
+  archiveTask,
+  calNext,
+  calPrev,
+  closeModal,
+  closeSidebar,
+  dashStatClick,
+  deleteArchivedCompletion,
+  deleteRoutineTask,
+  editTask,
+  exportExcel,
+  exportPerfExcel,
+  exportRoutineTasks,
+  handleNewRoutineFiles,
+  importExcel,
+  importRoutineTasks,
+  login,
+  logout,
+  markAllNotifSeen,
+  markChecked,
+  markComplete,
+  markCompletePersonalTask,
+  markNotifSeen,
+  migrateLocalToSupabase,
+  navigateTo,
+  openDocRequest,
+  openNewTask,
+  openRemarks,
+  openSidebar,
+  permDelete,
+  permanentDeleteRoutineTask,
+  previewFiles,
+  removeAttachment,
+  removeAttachmentFromEdit,
+  renderMyTasks,
+  renderPerformance,
+  renderPersonalTasksView,
+  renderRoutineTasks,
+  renderSchedule,
+  renderTasks,
+  restoreRoutineTask,
+  restoreTask,
+  savePersonalTask,
+  saveTaskLink,
+  sendEODSummary,
+  sendMorningSummary,
+  sendRoutineEODEmail,
+  showAddPersonalTask,
+  showAddRoutineTask,
+  showCalDayTasks,
+  showNotifications,
+  switchPTFilter,
+  switchRoutineTab,
+  toggleRoutineArchiveView,
+  toggleRoutineTask,
+  toggleStep,
+  toggleSumuduPTView,
+  toggleTheme,
+  uploadRoutineAttachment,
+  viewEmailById,
+  viewRoutineTask,
+  viewTask,
+  globalSearch,
+  canWrite
+};
