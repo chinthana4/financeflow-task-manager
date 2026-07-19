@@ -16,16 +16,20 @@ let charts = {};
 
 async function loadDB(){
   try {
+    // Column lists trimmed to exactly what's mapped below (was select('*') —
+    // fetched every column including ones never read, on every login).
+    // ff_email_log is also the fastest-growing table (already the largest by
+    // far), so it's capped to the most recent 300 rather than fetched in full.
     const [tRes, cRes, eRes, spRes, rbRes, dsRes, rtRes, rcRes, ptRes] = await Promise.all([
-      sb.from('ff_tasks').select('*'),
-      sb.from('ff_comments').select('*'),
-      sb.from('ff_email_log').select('*'),
-      sb.from('ff_step_progress').select('*'),
-      sb.from('ff_recycle_bin').select('*'),
-      sb.from('ff_daily_summary').select('*'),
-      sb.from('ff_recurring_tasks').select('*'),
-      sb.from('ff_recurring_completions').select('*'),
-      sb.from('ff_personal_tasks').select('*')
+      sb.from('ff_tasks').select('id,title,description,assigned_to,assigned_by,assigned_date,deadline_date,completion_date,priority,status,external_link,is_recurring,recurrence_type,urgent_flag,steps,attachments,created_date,updated_date,checked_by,checked_date,is_doc_request'),
+      sb.from('ff_comments').select('id,task_id,user_id,text,created_date'),
+      sb.from('ff_email_log').select('id,type,subject,to_email,from_email,body,task_id,timestamp').order('timestamp',{ascending:false}).limit(300),
+      sb.from('ff_step_progress').select('task_id,step_id,done'),
+      sb.from('ff_recycle_bin').select('id,title,description,assigned_to,assigned_by,assigned_date,deadline_date,completion_date,priority,status,external_link,is_recurring,recurrence_type,urgent_flag,steps,attachments,created_date,updated_date,deleted_by,deleted_date'),
+      sb.from('ff_daily_summary').select('date,employee,completed_count,overdue_count'),
+      sb.from('ff_recurring_tasks').select('id,title,frequency,assigned_to,created_by,created_date,reminder_time,active,remarks,link,archived,archived_date,attachments,deadline_date,deadline_time'),
+      sb.from('ff_recurring_completions').select('id,task_id,due_date,completed_at,completed_by,status,deadline_date,deadline_time,auto_archive_at'),
+      sb.from('ff_personal_tasks').select('id,title,description,owner,deadline_date,deadline_time,recurrence,status,completion_date,created_date,link,attachments')
     ]);
     DB.tasks = (tRes.data||[]).map(r=>({
       id:r.id, title:r.title, description:r.description, assignedTo:r.assigned_to,
@@ -40,10 +44,14 @@ async function loadDB(){
     DB.comments = (cRes.data||[]).map(r=>({
       id:r.id, taskId:r.task_id, userId:r.user_id, text:r.text, createdDate:r.created_date
     }));
+    // Fetched newest-first (see the .order() above) so the 300-row cap keeps
+    // the most recent emails; reversed back to oldest-first here so DB.emailLog
+    // keeps the exact same storage order it always had — renderEmailLog() and
+    // every other reader still does its own .reverse() to show newest-first.
     DB.emailLog = (eRes.data||[]).map(r=>({
       id:r.id, type:r.type, subject:r.subject, to:r.to_email, from:r.from_email,
       body:r.body, taskId:r.task_id, timestamp:r.timestamp
-    }));
+    })).reverse();
     DB.stepProgress = {};
     (spRes.data||[]).forEach(r=>{
       if(!DB.stepProgress[r.task_id]) DB.stepProgress[r.task_id]={};
@@ -66,7 +74,12 @@ async function loadDB(){
     DB.routineTasks=(rtRes.data||[]).map(r=>({
       id:r.id, title:r.title, frequency:r.frequency, assignedTo:r.assigned_to,
       createdBy:r.created_by, createdDate:r.created_date, reminderTime:r.reminder_time||'09:00', active:r.active!==false,
-      remarks:r.remarks||'', link:r.link||'', archived:r.archived||false, archivedDate:r.archived_date||null, attachments:r.attachments||[]
+      remarks:r.remarks||'', link:r.link||'', archived:r.archived||false, archivedDate:r.archived_date||null, attachments:r.attachments||[],
+      // Pre-existing bug fixed here: deadlineDate/deadlineTime are read
+      // throughout the routine-task logic (completion deadlines, exports)
+      // but were never populated from the fetched row, so they were always
+      // undefined for any routine task loaded after a page refresh.
+      deadlineDate:r.deadline_date||'', deadlineTime:r.deadline_time||''
     }));
     DB.routineCompletions=(rcRes.data||[]).map(r=>({
       id:r.id, taskId:r.task_id, dueDate:r.due_date, completedAt:r.completed_at,
