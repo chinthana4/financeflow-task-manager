@@ -3,6 +3,36 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<!--
+  Content-Security-Policy — honest note on its limits in this app:
+  script-src/style-src need 'unsafe-inline' because the app uses 78+ inline
+  onclick="" handlers and hundreds of inline style="" attributes throughout
+  (a monolithic single-file architecture). Removing 'unsafe-inline' would
+  require converting every onclick to addEventListener and every inline
+  style to a class — a real improvement, but a structural refactor, not a
+  safe drop-in change. Tracked as follow-up work (breaking up the monolith).
+
+  What this CSP DOES still protect against even with 'unsafe-inline':
+  - object-src 'none' + base-uri 'self': blocks plugin/base-tag injection
+  - frame-ancestors 'none': blocks clickjacking (embedding this app in a
+    malicious iframe)
+  - connect-src / img-src / font-src allow-lists: even if an attacker got
+    a script to run, it can't exfiltrate data to or load resources from
+    arbitrary third-party domains — only the ones this app actually uses
+  - form-action 'self': blocks form-based data exfiltration
+-->
+<meta http-equiv="Content-Security-Policy" content="
+  default-src 'self';
+  script-src 'self' https://cdn.jsdelivr.net 'unsafe-inline';
+  style-src 'self' https://fonts.googleapis.com 'unsafe-inline';
+  font-src 'self' https://fonts.gstatic.com;
+  img-src 'self' data: https://ohkkxaxgiziuvdovpnmu.supabase.co;
+  connect-src 'self' https://ohkkxaxgiziuvdovpnmu.supabase.co https://api.emailjs.com;
+  object-src 'none';
+  base-uri 'self';
+  form-action 'self';
+  frame-ancestors 'none';
+">
 <title>FinanceFlow — Task Management</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
@@ -1634,7 +1664,7 @@ function renderMyTasks(){
       <td><div class="task-title-cell"><div class="title ${t.status==='Completed'?'completed':''}">${(t.urgentFlag||(t.deadlineDate&&t.deadlineDate<today()&&t.status!=='Completed'))&&!t.isDocRequest?'<span class="urgent-banner">🔴 Urgent</span> ':''}${escHtml(t.title)}${t.isRecurring?' \u{1F504}':''}</div><div class="desc">${escHtml(t.description||'')}</div>${checkedBadge}</div></td>
       <td>${statusBadge(t.status)}</td>
       <td style="color:${t.deadlineDate&&t.deadlineDate<today()&&t.status!=='Completed'?'var(--danger)':'inherit'};font-weight:500">${t.isDocRequest?'—':fmt(t.deadlineDate)}</td>
-      <td>${t.externalLink?`<a href="${escHtml(t.externalLink)}" target="_blank" rel="noopener" class="link-chip">Open</a>`:'—'}</td>
+      <td>${t.externalLink?`<a href="${sanitizeUrl(t.externalLink)}" target="_blank" rel="noopener" class="link-chip">Open</a>`:'—'}</td>
       <td>
         <div style="display:flex;gap:6px;flex-wrap:wrap" onclick="event.stopPropagation()">
           <button class="btn btn-secondary btn-sm" onclick="viewTask('${t.id}')">View</button>
@@ -1663,7 +1693,7 @@ function renderMyRequests(){
       }
       if(attachments.length){
         responseHtml+=`<div style="color:var(--text3);font-weight:600;margin-top:6px;margin-bottom:4px">Attachments:</div>`;
-        responseHtml+=attachments.map(f=>`<a href="${escHtml(f.url)}" target="_blank" rel="noopener" class="attached-file" style="text-decoration:none;display:inline-flex;margin-right:6px"><span class="file-icon">📄</span><span class="file-name">${escHtml(f.name)}</span><span style="color:var(--primary);font-size:11px;font-weight:600">⬇</span></a>`).join('');
+        responseHtml+=attachments.map(f=>`<a href="${sanitizeUrl(f.url)}" target="_blank" rel="noopener" class="attached-file" style="text-decoration:none;display:inline-flex;margin-right:6px"><span class="file-icon">📄</span><span class="file-name">${escHtml(f.name)}</span><span style="color:var(--primary);font-size:11px;font-weight:600">⬇</span></a>`).join('');
       }
       responseHtml+=`</div>`;
     }
@@ -1952,7 +1982,7 @@ function viewTask(tid){
       if(isTrupal){
         return `<div class="attached-file"><span class="file-icon">\u{1F4C4}</span><span class="file-name">${escHtml(f.name)}</span><span style="color:var(--text3);font-size:11px">🔒 View only</span></div>`;
       }
-      return `<div class="attached-file"><a href="${escHtml(f.url)}" target="_blank" rel="noopener" style="display:flex;align-items:center;gap:10px;flex:1;text-decoration:none;color:inherit"><span class="file-icon">\u{1F4C4}</span><span class="file-name">${escHtml(f.name)}</span><span style="color:var(--primary);font-size:12px;font-weight:600">⬇ Open</span></a>${removeBtn}</div>`;
+      return `<div class="attached-file"><a href="${sanitizeUrl(f.url)}" target="_blank" rel="noopener" style="display:flex;align-items:center;gap:10px;flex:1;text-decoration:none;color:inherit"><span class="file-icon">\u{1F4C4}</span><span class="file-name">${escHtml(f.name)}</span><span style="color:var(--primary);font-size:12px;font-weight:600">⬇ Open</span></a>${removeBtn}</div>`;
     }
     return `<div class="attached-file"><span class="file-icon">\u{1F4C4}</span><span class="file-name">${escHtml(typeof f==='string'?f:f.name)}</span>${removeBtn}</div>`;
   }).join('')}</div>`:'<p style="color:var(--text3);font-size:13px">No attachments</p>';
@@ -1976,7 +2006,7 @@ function viewTask(tid){
       <div style="display:flex;gap:8px;align-items:center">
         <input type="url" id="vt-link-${tid}" value="${escHtml(t.externalLink||'')}" placeholder="https://..." style="flex:1;padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;background:var(--surface);color:var(--text)">
         <button class="btn btn-primary btn-sm" style="font-size:11px;padding:5px 10px" onclick="saveTaskLink('${tid}')">Save</button>
-        ${t.externalLink?`<a href="${escHtml(t.externalLink)}" target="_blank" rel="noopener" style="font-size:12px;color:var(--primary);white-space:nowrap">🔗 Open</a>`:''}
+        ${t.externalLink?`<a href="${sanitizeUrl(t.externalLink)}" target="_blank" rel="noopener" style="font-size:12px;color:var(--primary);white-space:nowrap">🔗 Open</a>`:''}
       </div>
     </div>
     ${stepsHtml}
@@ -1996,7 +2026,7 @@ function viewTask(tid){
           <div class="comment-bubble">
             <div class="comment-meta"><strong>${USERS[c.userId]?.name||c.userId}</strong> · ${new Date(c.createdDate).toLocaleString()}</div>
             <div class="comment-text">${escHtml(c.text)}</div>
-            ${(c.attachments&&c.attachments.length)?`<div style="margin-top:8px;border-top:1px solid var(--border-subtle);padding-top:6px"><div style="font-size:11px;color:var(--text3);font-weight:600;margin-bottom:4px">📎 Reply Attachments</div>${c.attachments.map(a=>'<div style="margin-top:3px"><a href="'+escHtml(a.url)+'" target="_blank" style="font-size:12px;color:var(--primary)">📄 '+escHtml(a.name)+'</a></div>').join('')}</div>`:''}
+            ${(c.attachments&&c.attachments.length)?`<div style="margin-top:8px;border-top:1px solid var(--border-subtle);padding-top:6px"><div style="font-size:11px;color:var(--text3);font-weight:600;margin-bottom:4px">📎 Reply Attachments</div>${c.attachments.map(a=>'<div style="margin-top:3px"><a href="'+sanitizeUrl(a.url)+'" target="_blank" style="font-size:12px;color:var(--primary)">📄 '+escHtml(a.name)+'</a></div>').join('')}</div>`:''}
           </div>
         </div>`).join(''):'<p style="color:var(--text3);font-size:13px;margin-bottom:14px">No comments yet.</p>'}
       ${currentUser!=='trupal'?`<div class="comment-input-row"><input id="comment-input" placeholder="Write a remark..." onkeydown="if(event.key==='Enter')addComment('${tid}')"><div style="display:flex;gap:4px;align-items:center"><label class="btn btn-secondary btn-sm" style="cursor:pointer;padding:5px 8px" title="Attach file to reply">📎<input type="file" multiple id="comment-files" style="display:none"></label><button class="btn btn-primary btn-sm" onclick="addComment('${tid}')">Send</button></div></div><div id="comment-files-preview" style="margin-top:4px;font-size:12px;color:var(--text3)"></div>`:'<p style="color:var(--text3);font-size:12px;font-style:italic">View only — comments disabled</p>'}
@@ -2083,7 +2113,7 @@ function editTask(tid){
     <div class="form-field full"><label>Attachments</label>
       <div class="attached-files" id="et-attachments">${(t.attachments||[]).map((f,i)=>{
         const name=typeof f==='object'?f.name:f;
-        const link=typeof f==='object'&&f.url?`<a href="${escHtml(f.url)}" target="_blank" rel="noopener" style="color:var(--primary);font-size:12px;font-weight:600;text-decoration:none">⬇ Open</a>`:'';
+        const link=typeof f==='object'&&f.url?`<a href="${sanitizeUrl(f.url)}" target="_blank" rel="noopener" style="color:var(--primary);font-size:12px;font-weight:600;text-decoration:none">⬇ Open</a>`:'';
         return `<div class="attached-file"><span class="file-icon">📄</span><span class="file-name">${escHtml(name)}</span>${link}<button class="file-remove" onclick="removeAttachmentFromEdit('${tid}',${i})">✕</button></div>`;
       }).join('')}</div>
       <div class="file-upload-area" style="margin-top:10px;padding:14px">
@@ -2626,7 +2656,7 @@ async function simulateEmail(type, task){
       <tr><th>Deadline</th><td>${fmt(task.deadlineDate)}</td></tr>
       <tr><th>Status</th><td>${task.status}</td></tr></table>
       ${task.description?`<p><strong>Details:</strong> ${escHtml(task.description)}</p>`:''}
-      ${task.externalLink?`<p><strong>Link:</strong> <a href="${escHtml(task.externalLink)}">${escHtml(task.externalLink)}</a></p>`:''}
+      ${task.externalLink?`<p><strong>Link:</strong> <a href="${sanitizeUrl(task.externalLink)}">${escHtml(task.externalLink)}</a></p>`:''}
       <p style="margin-top:14px;color:#6366f1;font-weight:600">— FinanceFlow Task Management</p>`;
   }
 
@@ -2836,6 +2866,20 @@ function closeSidebar(){ document.getElementById('sidebar').classList.remove('op
 // UTILS
 // ═══════════════════════════════════════════════════════
 function escHtml(s){ const d=document.createElement('div'); d.textContent=String(s||''); return d.innerHTML; }
+
+// escHtml alone stops tag/attribute injection but NOT dangerous URL schemes
+// (e.g. a task's External Link field set to "javascript:alert(1)" would still
+// render as a clickable, executing link). Only allow http(s)/mailto/tel; any
+// href built from user-controlled data must go through this first.
+function sanitizeUrl(u){
+  const s=String(u||'').trim();
+  if(!s) return '';
+  try{
+    const parsed=new URL(s, window.location.href);
+    if(['http:','https:','mailto:','tel:'].includes(parsed.protocol)) return escHtml(s);
+  }catch(e){ /* not a valid absolute/relative URL */ }
+  return '#';
+}
 
 // ═══════════════════════════════════════════════════════
 // SIDEBAR CALENDAR
@@ -3456,7 +3500,7 @@ function viewRoutineTask(id){
 
   const attachList=(rt.attachments||[]).map(a=>`<div style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:var(--bg-subtle);border-radius:var(--radius-sm);margin-top:4px">
     <span style="font-size:13px">📎</span>
-    <a href="${escHtml(a.url)}" target="_blank" style="font-size:13px;color:var(--primary);flex:1;word-break:break-all">${escHtml(a.name)}</a>
+    <a href="${sanitizeUrl(a.url)}" target="_blank" style="font-size:13px;color:var(--primary);flex:1;word-break:break-all">${escHtml(a.name)}</a>
   </div>`).join('');
 
   const isManager=currentUser==='sumudu';
@@ -3515,7 +3559,7 @@ function viewRoutineTask(id){
     <div>
       <label style="font-size:12px;font-weight:600;color:var(--text2)">Link</label>
       <input type="url" id="rt-link" value="${escHtml(rt.link||'')}" ${canMod?'':'disabled'} placeholder="https://..." style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:14px;background:var(--surface);color:var(--text);margin-top:4px">
-      ${rt.link?`<a href="${escHtml(rt.link)}" target="_blank" style="color:var(--primary);font-size:12px;margin-top:4px;display:inline-block">🔗 Open link in new tab</a>`:''}
+      ${rt.link?`<a href="${sanitizeUrl(rt.link)}" target="_blank" style="color:var(--primary);font-size:12px;margin-top:4px;display:inline-block">🔗 Open link in new tab</a>`:''}
     </div>
     <div>
       <label style="font-size:12px;font-weight:600;color:var(--text2)">Attachments</label>
@@ -3894,7 +3938,7 @@ function renderPersonalTasks(){
       <div style="flex:1;min-width:0">
         <div style="font-weight:600;font-size:14px;${t.status==='Completed'?'text-decoration:line-through;opacity:.6':''}">${escHtml(t.title)}${recLabel}</div>
         ${t.description?`<div style="font-size:12px;color:var(--text3);margin-top:2px">${escHtml(t.description)}</div>`:''}
-        <div style="font-size:11px;color:var(--text3);margin-top:4px">Due: ${dl.toLocaleDateString('en-GB')} ${dl.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'})}${t.link?` | <a href="${escHtml(t.link)}" target="_blank" style="color:var(--primary)">Link</a>`:''}</div>
+        <div style="font-size:11px;color:var(--text3);margin-top:4px">Due: ${dl.toLocaleDateString('en-GB')} ${dl.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'})}${t.link?` | <a href="${sanitizeUrl(t.link)}" target="_blank" style="color:var(--primary)">Link</a>`:''}</div>
       </div>
       <div style="display:flex;gap:8px;align-items:center;flex-shrink:0">
         <span style="background:${statusColor};color:#fff;padding:2px 10px;border-radius:12px;font-size:11px;font-weight:600">${t.status}</span>
