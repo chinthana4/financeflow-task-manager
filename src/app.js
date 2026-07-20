@@ -204,6 +204,16 @@ async function login(){
   initApp();
 }
 
+async function forgotPassword(){
+  const uid = document.getElementById('login-user').value;
+  const email = USERS[uid]?.email;
+  if(!email){ showToast('Select an account first','error'); return; }
+  const { error } = await sb.auth.resetPasswordForEmail(email, {
+    redirectTo: window.location.origin + window.location.pathname
+  });
+  if(error){ showToast('Failed to send reset email','error'); return; }
+  showToast('Password reset link sent to ' + email, 'success');
+}
 async function logout(){
   await sb.auth.signOut();
   currentUser=null;
@@ -3116,6 +3126,7 @@ export {
   exportExcel,
   exportPerfExcel,
   exportRoutineTasks,
+  forgotPassword,
   handleNewRoutineFiles,
   importExcel,
   importRoutineTasks,
