@@ -271,12 +271,17 @@
           <div class="page-header">
             <h2>Personal Tasks</h2>
             <div class="page-header-actions">
+              <button class="btn btn-primary btn-sm" onclick="showAddPersonalTask()">+ Add Task</button>
               <button class="btn btn-secondary btn-sm" onclick="toggleSumuduPTView(true)">👁️ View Team</button>
             </div>
           </div>
-          <div style="border-radius:var(--radius);overflow:hidden;border:1px solid var(--border-subtle);height:calc(100vh - 160px)">
-            <iframe id="personal-tasks-frame" style="width:100%;height:100%;border:none;background:#fff"></iframe>
+          <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap" id="pt-sumudu-filter-tabs">
+            <button class="btn btn-sm btn-primary" onclick="switchPTFilter('all')" id="pt-sumudu-tab-all">All</button>
+            <button class="btn btn-sm btn-secondary" onclick="switchPTFilter('Pending')" id="pt-sumudu-tab-Pending">Pending</button>
+            <button class="btn btn-sm btn-secondary" onclick="switchPTFilter('Completed')" id="pt-sumudu-tab-Completed">Completed</button>
+            <button class="btn btn-sm btn-secondary" onclick="switchPTFilter('Overdue')" id="pt-sumudu-tab-Overdue">Overdue</button>
           </div>
+          <div class="card"><div id="pt-sumudu-content"></div></div>
         </div>
       </div>
       <div id="personal-tasks-officer" style="display:none">
