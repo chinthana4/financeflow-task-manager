@@ -3119,6 +3119,7 @@ export {
   calPrev,
   closeModal,
   closeSidebar,
+  createTask,
   dashStatClick,
   deleteArchivedCompletion,
   deleteRoutineTask,
