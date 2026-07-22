@@ -2048,8 +2048,7 @@ function markOverdueRoutines(){
 function canModifyRoutineTask(rt){
   if(currentUser==='sumudu') return true;
   if(currentUser==='de') return true;
-  if(currentUser==='mitiksha' && rt.assignedTo==='mitiksha') return true;
-  if(currentUser==='mitiksha' && rt.createdBy==='mitiksha') return true;
+  if(currentUser==='mitiksha') return true;
   return false;
 }
 
@@ -2708,7 +2707,7 @@ async function restoreRoutineTask(id){
 }
 
 async function deleteRoutineTask(id){
-  if(currentUser!=='sumudu'){showToast('Only Sumudu can delete routine tasks','error');return;}
+  if(currentUser!=='sumudu' && currentUser!=='de' && currentUser!=='mitiksha'){showToast('You do not have permission to delete routine tasks','error');return;}
   if(!confirm('Delete this routine task permanently?')) return;
   DB.routineTasks=DB.routineTasks.filter(t=>t.id!==id);
   DB.routineCompletions=DB.routineCompletions.filter(c=>c.taskId!==id);
@@ -2719,7 +2718,7 @@ async function deleteRoutineTask(id){
 }
 
 async function permanentDeleteRoutineTask(id){
-  if(currentUser!=='sumudu'){showToast('Only Sumudu can delete routine tasks','error');return;}
+  if(currentUser!=='sumudu' && currentUser!=='de' && currentUser!=='mitiksha'){showToast('You do not have permission to delete routine tasks','error');return;}
   if(!confirm('Permanently delete this archived task? This cannot be undone.')) return;
   DB.routineTasks=DB.routineTasks.filter(t=>t.id!==id);
   DB.routineCompletions=DB.routineCompletions.filter(c=>c.taskId!==id);
